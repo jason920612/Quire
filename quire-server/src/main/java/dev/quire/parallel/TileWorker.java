@@ -22,8 +22,8 @@ public final class TileWorker extends TickThread {
     /** Per-thread Level#getBlockRandomPos sequence. */
     public int randValue = (int) System.nanoTime();
 
-    private final IdentityHashMap<Level, CollectingNeighborUpdater> neighborUpdaters = new IdentityHashMap<>();
-    private final IdentityHashMap<Level, PathTypeCache> pathTypeCaches = new IdentityHashMap<>();
+    private final java.util.WeakHashMap<Level, CollectingNeighborUpdater> neighborUpdaters = new java.util.WeakHashMap<>(); // weak: unloaded worlds
+    private final java.util.WeakHashMap<Level, PathTypeCache> pathTypeCaches = new java.util.WeakHashMap<>();
     /** Block positions whose path type this worker invalidated during the current phase. */
     final it.unimi.dsi.fastutil.longs.LongArrayList pathInvalidations = new it.unimi.dsi.fastutil.longs.LongArrayList();
 

@@ -26,7 +26,7 @@ import net.minecraft.world.level.chunk.PalettedContainer;
 public final class SectionCompactor {
     private static final long BUDGET_NANOS = Long.getLong("quire.compressSections.budgetMicros", 300L) * 1000L;
     private static final int MAX_IN_FLIGHT = 2048;
-    private static final IdentityHashMap<ServerLevel, int[]> CURSORS = new IdentityHashMap<>();
+    private static final java.util.WeakHashMap<ServerLevel, int[]> CURSORS = new java.util.WeakHashMap<>(); // weak: unloaded worlds must not be retained
     public static final LongAdder PASSES = new LongAdder();
     public static final LongAdder DISCARDED = new LongAdder();
 

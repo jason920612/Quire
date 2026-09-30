@@ -31,8 +31,10 @@ public final class LightFreezer {
     private static final int MAX_QUEUED = 64;
     private static final long BUDGET_NANOS = 150_000L;
 
-    private static final IdentityHashMap<ServerLevel, int[]> CURSORS = new IdentityHashMap<>();
-    private static final Set<LevelChunk> PENDING = ConcurrentHashMap.newKeySet();
+    private static final java.util.WeakHashMap<ServerLevel, int[]> CURSORS = new java.util.WeakHashMap<>(); // weak: unloaded worlds must not be retained
+    // chunk -> queue time; entries of tasks that never ran (world unloaded) expire so chunks are not retained
+    private static final ConcurrentHashMap<LevelChunk, Long> PENDING = new ConcurrentHashMap<>();
+    private static final long PENDING_EXPIRY_NANOS = 120_000_000_000L;
     public static final LongAdder FROZEN = new LongAdder();
     public static final LongAdder QUEUED = new LongAdder();
     public static final LongAdder RAN = new LongAdder();
@@ -46,6 +48,10 @@ public final class LightFreezer {
             return;
         }
         final long deadline = System.nanoTime() + BUDGET_NANOS;
+        if (!PENDING.isEmpty()) {
+            final long now = System.nanoTime();
+            PENDING.values().removeIf(queued -> now - queued > PENDING_EXPIRY_NANOS);
+        }
         final int idleBefore = clock() - IDLE_UNITS;
         for (final ServerLevel level : server.getAllLevels()) {
             final var loaded = ((ChunkSystemServerLevel) level).moonrise$getLoadedChunks();
@@ -62,12 +68,12 @@ public final class LightFreezer {
                 cursor[0] = (cursor[0] + 1) % size;
                 CANDIDATE_SCANS.increment();
                 final LevelChunk chunk = raw[cursor[0]];
-                if (chunk == null || PENDING.contains(chunk)) {
+                if (chunk == null || PENDING.containsKey(chunk)) {
                     continue;
                 }
                 if (needsFreeze(((StarlightChunk) chunk).starlight$getBlockNibbles(), idleBefore)
                     || needsFreeze(((StarlightChunk) chunk).starlight$getSkyNibbles(), idleBefore)) {
-                    PENDING.add(chunk);
+                    PENDING.put(chunk, System.nanoTime());
                     QUEUED.increment();
                     ((ChunkSystemServerLevel) level).moonrise$getChunkTaskScheduler().radiusAwareScheduler.queueTask(
                         chunk.getPos().x(), chunk.getPos().z(), ((ChunkSystemChunkStatus) ChunkStatus.LIGHT).moonrise$getWriteRadius(),

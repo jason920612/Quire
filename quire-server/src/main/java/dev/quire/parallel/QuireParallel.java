@@ -323,7 +323,7 @@ public final class QuireParallel {
     public static final int STAGE_BLOCK_ENTITIES = 1;
     public static final int STAGE_CHUNKS = 2;
     private static final String[] STAGE_NAMES = {"entities", "blockEntities", "chunks"};
-    private static final java.util.IdentityHashMap<ServerLevel, StageController[]> STAGES = new java.util.IdentityHashMap<>();
+    private static final java.util.WeakHashMap<ServerLevel, StageController[]> STAGES = new java.util.WeakHashMap<>(); // weak: unloaded worlds
 
     /** Main thread only. Arms: serial, then tile shifts 0..MAX_AUTO_SHIFT. */
     static StageController stage(final ServerLevel level, final int stage) {

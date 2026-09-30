@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 17:54:29 +0800
+Subject: [PATCH] Prove air above the terrain and skip its density (exact); no
+ load-time section encoding
+
+Per chunk, an upper bound of the final density at the interpolation corners
+(exact 1D/2D terrain inputs, interval arithmetic for 3D noise, range_choice
+branch selection) proves the height above which every block has negative
+density; those blocks are not sampled and get the aquifer result of any
+negative density there (verify: -Dquire.gen.verify=true). Section and light
+encoding no longer run while chunks load (they slowed loading ~20%).
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index 65c88f21c27082727405fd0ef414737006261b80..c4aa01cd283d871557b9a45e53d846f3babf99a5 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -313,8 +313,20 @@ public final class RegionizedPlayerChunkLoader {
+     }
+     // Quire end - view ring release
+ 
++    private int quireSweepCounter; // Quire - view ring release
++
+     public void tick() {
+         TickThread.ensureTickThread("Cannot tick player chunk loader async");
++        // Quire start - view ring release: drop players that left without a normal forget (never retain them)
++        if (++this.quireSweepCounter >= 1200 && !this.quireReleasedReceivers.isEmpty()) {
++            this.quireSweepCounter = 0;
++            this.quireReleasedReceivers.values().removeIf(players -> {
++                players.removeIf(player -> player.isRemoved() || player.level() != this.world
++                    || ((ChunkSystemServerPlayer)player).moonrise$getChunkLoader() == null);
++                return players.isEmpty();
++            });
++        }
++        // Quire end
+         long currTime = System.nanoTime();
+         for (final ServerPlayer player : new java.util.ArrayList<>(this.world.players())) {
+             final PlayerChunkLoaderData loader = ((ChunkSystemServerPlayer)player).moonrise$getChunkLoader();
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+index 37a0deea7e48991763be56459bda0e742f82646b..b669615d856da79a8aedefba8c23ff394427e04a 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+@@ -231,7 +231,6 @@ public final class SWMRNibbleArray {
+         }
+         this.stateUpdating = this.stateVisible = (byte)state; // Quire - byte states
+         this.storageUpdating = this.storageVisible = dedupe(bytes); // Quire - share uniform nibble data
+-        this.quire$freeze(); // Quire - frozen light: loaded light starts frozen (not yet published, so this is safe)
+     }
+ 
+     @Override
+diff --git a/net/minecraft/world/level/chunk/PalettedContainer.java b/net/minecraft/world/level/chunk/PalettedContainer.java
+index 9e0feadb57750749145d845fe54d928dfdea39f2..1f7cd0cbfaec46b0588d4be1be6453f37503760a 100644
+--- a/net/minecraft/world/level/chunk/PalettedContainer.java
++++ b/net/minecraft/world/level/chunk/PalettedContainer.java
+@@ -543,7 +543,8 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+ 
+         // Quire start - section compression: block sections start out compressed (they inflate on first access)
+         final PalettedContainer<T> container = new PalettedContainer<>(strategy, storedConfiguration, storage, palette, paletteEntries, defaultValue, presetValues); // Paper - Anti-Xray - Add preset values
+-        if (dev.quire.memory.SectionCompression.ENABLED && entryCount == 4096) {
++        // sparse mode encodes later, off-thread (SectionCompactor): encoding here slowed chunk loading by ~20%
++        if (dev.quire.memory.SectionCompression.DEFLATE && entryCount == 4096) {
+             container.quire$compress();
+         }
+         return DataResult.success(container);
+diff --git a/net/minecraft/world/level/levelgen/Aquifer.java b/net/minecraft/world/level/levelgen/Aquifer.java
+index 7b53acc0c5f02bc1ae27852b36b6864baa1a72de..1cef10b52eb1bedf1b9cfc1e267a6e00f8768769 100644
+--- a/net/minecraft/world/level/levelgen/Aquifer.java
++++ b/net/minecraft/world/level/levelgen/Aquifer.java
+@@ -42,6 +42,11 @@ public interface Aquifer {
+ 
+     boolean shouldScheduleFluidUpdate();
+ 
++    /** Quire - above this Y a non-positive density gives the same substance whatever its value (the global fluid). */
++    default int quire$skipSamplingAboveY() {
++        return Integer.MIN_VALUE;
++    }
++
+     record Config(
+         DensityFunction barrierNoise,
+         DensityFunction fluidLevelFloodednessNoise,
+@@ -116,6 +121,11 @@ public interface Aquifer {
+         private final DensitySampler.Bound exclusion;
+         private boolean shouldScheduleFluidUpdate;
+         private final int skipSamplingAboveY;
++
++        @Override
++        public int quire$skipSamplingAboveY() { // Quire
++            return this.skipSamplingAboveY;
++        }
+         private final int minGridX;
+         private final int minGridY;
+         private final int minGridZ;
+@@ -210,7 +220,7 @@ public interface Aquifer {
+             }
+ 
+             Aquifer.FluidStatus globalFluid = this.globalFluidPicker.computeFluid(blockX, blockY, blockZ);
+-            if (blockY > this.skipSamplingAboveY) {
++            if (blockY > this.skipSamplingAboveY) { // Quire - see quire$skipSamplingAboveY
+                 this.shouldScheduleFluidUpdate = false;
+                 return globalFluid.at(blockY);
+             }
+diff --git a/net/minecraft/world/level/levelgen/Beardifier.java b/net/minecraft/world/level/levelgen/Beardifier.java
+index 7041d673e6f6b7b629d325fee770e640f75725a1..fdd57de3e8cd4945a7b99952d42b67ddbc37ed59 100644
+--- a/net/minecraft/world/level/levelgen/Beardifier.java
++++ b/net/minecraft/world/level/levelgen/Beardifier.java
+@@ -43,6 +43,11 @@ public class Beardifier implements DensitySampler {
+     private final List<JigsawJunction> junctions;
+     private final @Nullable BoundingBox affectedBox;
+ 
++    // Quire - the structure term is exactly zero outside this box
++    public @Nullable BoundingBox quire$affectedBox() {
++        return this.affectedBox;
++    }
++
+     public static Beardifier forStructuresInChunk(final StructureManager structureManager, final ChunkPos chunkPos) {
+         List<StructureStart> structureStarts = structureManager.startsForStructure(
+             chunkPos.x(), chunkPos.z(), s -> s.terrainAdaptation() != TerrainAdjustment.NONE
+diff --git a/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java b/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java
+index f0529d233b791e226cec469b2efebcffd02c6d58..1fc6c38e5caf0aacf3feab2ca98044fc64b87325 100644
+--- a/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java
++++ b/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java
+@@ -444,7 +444,29 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+         DensityVolume volume = noiseChunk.volume();
+         DensitySampler.Bound finalDensity = noiseChunk.cachingSamplers().get(this.settings.value().noiseRouter().finalDensity());
+ 
+-        try (ScopedDensityBuffer densityBuffer = finalDensity.sampleVolume(volume)) {
++        // Quire start - sky bound: blocks from cutY up provably have negative final density; their density is not
++        // computed and the aquifer gets a negative stand-in (above its sampling limit only the sign matters)
++        int cutY = volume.minBlockY() + volume.sizeY();
++        if (dev.quire.worldgen.SkyBound.ENABLED && !noiseChunk.quireBlending) {
++            int proven = dev.quire.worldgen.SkyBound.provenAirFromY(this.settings.value().noiseRouter().finalDensity(), noiseChunk.cachingSamplers(), volume);
++            int floor = aquifer.quire$skipSamplingAboveY() == Integer.MIN_VALUE ? Integer.MIN_VALUE : aquifer.quire$skipSamplingAboveY() + 1;
++            final net.minecraft.world.level.levelgen.structure.BoundingBox beardBox = noiseChunk.quireBeardifier == null ? null : noiseChunk.quireBeardifier.quire$affectedBox();
++            if (beardBox != null) {
++                floor = Math.max(floor, beardBox.maxY() + 1);
++            }
++            // keep the cut on the interpolation grid (cells of 8 blocks from the bottom)
++            int cut = Math.max(proven, floor);
++            int rel = cut - volume.minBlockY();
++            rel = rel <= 0 ? 0 : ((rel + 7) / 8) * 8;
++            cutY = Math.min(volume.minBlockY() + volume.sizeY(), volume.minBlockY() + rel);
++        }
++        final DensityVolume sampledVolume = cutY >= volume.minBlockY() + volume.sizeY() ? volume
++            : new DensityVolume(volume.sizeX(), Math.max(8, cutY - volume.minBlockY()), volume.sizeZ(), volume.minBlockX(), volume.minBlockY(), volume.minBlockZ());
++        final int cutIndexY = cutY - volume.minBlockY();
++        // Quire end - sky bound
++
++        try (ScopedDensityBuffer densityBuffer = finalDensity.sampleVolume(sampledVolume); // Quire - sky bound
++             ScopedDensityBuffer verifyBuffer = dev.quire.worldgen.SkyBound.VERIFY && sampledVolume != volume ? finalDensity.sampleVolume(volume) : null) { // Quire - sky bound
+             for (int z = 0; z < volume.sizeZ(); z++) {
+                 int blockZ = volume.blockZ(z);
+ 
+@@ -454,7 +476,17 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+                     for (int y = volume.sizeY() - 1; y >= 0; y--) {
+                         int blockY = volume.blockY(y);
+                         LevelChunkSection section = chunk.getSection(chunk.getSectionIndex(blockY));
+-                        float density = densityBuffer.get(volume.indexUnchecked(x, y, z));
++                        // Quire start - sky bound
++                        float density;
++                        if (y >= cutIndexY) {
++                            density = -1.0F;
++                            if (verifyBuffer != null && verifyBuffer.get(volume.indexUnchecked(x, y, z)) > 0.0F) {
++                                throw new IllegalStateException("Quire sky bound wrong at " + blockX + " " + blockY + " " + blockZ + ": density " + verifyBuffer.get(volume.indexUnchecked(x, y, z)) + ", cut " + cutY);
++                            }
++                        } else {
++                            density = densityBuffer.get(sampledVolume.indexUnchecked(x, y, z));
++                        }
++                        // Quire end - sky bound
+                         BlockState state = aquifer.computeSubstance(blockX, blockY, blockZ, density);
+                         if (state == null) {
+                             state = this.settings.value().defaultBlock();
+diff --git a/net/minecraft/world/level/levelgen/NoiseChunk.java b/net/minecraft/world/level/levelgen/NoiseChunk.java
+index f580638bbe729d0706ebc64c0dcfe03f9f593c8e..aa5ddfe310ce40c053d23a3437102ca8dbd1a9cd 100644
+--- a/net/minecraft/world/level/levelgen/NoiseChunk.java
++++ b/net/minecraft/world/level/levelgen/NoiseChunk.java
+@@ -15,6 +15,10 @@ public class NoiseChunk implements AutoCloseable {
+     private final Aquifer aquifer;
+     private final DensityBufferPool bufferPool;
+     private final DensitySamplerSet cachingSamplers;
++    // Quire start - sky bound: what the density proof needs to know about this chunk
++    public final @Nullable Beardifier quireBeardifier;
++    public final boolean quireBlending;
++    // Quire end
+ 
+     public NoiseChunk(
+         final RandomState randomState,
+@@ -26,6 +30,8 @@ public class NoiseChunk implements AutoCloseable {
+     ) {
+         this.randomState = randomState;
+         this.volume = volume;
++        this.quireBeardifier = beardifier; // Quire
++        this.quireBlending = !blender.isEmpty(); // Quire
+         this.bufferPool = randomState.acquireDensityBufferPool();
+         ContextMap.Builder samplerUserFields = ContextMap.builder().set(Beardifier.CONTEXT_KEY, beardifier);
+         if (!blender.isEmpty()) {

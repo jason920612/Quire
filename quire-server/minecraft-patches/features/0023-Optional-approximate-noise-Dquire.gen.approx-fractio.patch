@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 18:29:22 +0800
+Subject: [PATCH] Optional approximate noise (-Dquire.gen.approx=<fraction>,
+ off by default)
+
+Drops the weakest noise octaves within the given fraction of the total
+amplitude. Measured: about 2% faster generation, terrain within 3 blocks
+of vanilla for 85% of columns at 0.05 - not recommended.
+
+diff --git a/net/minecraft/world/level/levelgen/synth/NoiseStack.java b/net/minecraft/world/level/levelgen/synth/NoiseStack.java
+index 3cb7094148b00eba7c46c3ec56653c02d179c6bb..11b6c931eb1080e479949f94f753d7929c806fa1 100644
+--- a/net/minecraft/world/level/levelgen/synth/NoiseStack.java
++++ b/net/minecraft/world/level/levelgen/synth/NoiseStack.java
+@@ -89,7 +89,7 @@ public class NoiseStack implements Noise {
+         }
+ 
+         public NoiseStack build() {
+-            NoiseStack.Layer[] layers = this.layers.toArray(NoiseStack.Layer[]::new);
++            NoiseStack.Layer[] layers = quire$approximate(this.layers.toArray(NoiseStack.Layer[]::new)); // Quire - approximate generation
+             if (this.layers.stream().allMatch(layer -> layer.noise.getClass() == PerlinNoise.class)) {
+                 return new NoiseStack.Perlin(layers);
+             } else {
+@@ -103,6 +103,51 @@ public class NoiseStack implements Noise {
+     protected record Layer(Noise noise, double frequency, float amplitude) {
+     }
+ 
++    // Quire start - approximate generation (-Dquire.gen.approx=<fraction>, off by default: worlds then differ from vanilla)
++    // Drops the weakest layers (octaves) while their total amplitude stays within the fraction of the stack's total, so
++    // every noise stays within that fraction of its range of the vanilla value; the heavy high-frequency octaves go first.
++    private static final float QUIRE_APPROX = Float.parseFloat(System.getProperty("quire.gen.approx", "0"));
++    private static boolean quireApproxLogged;
++
++    private static NoiseStack.Layer[] quire$approximate(final NoiseStack.Layer[] layers) {
++        if (!(QUIRE_APPROX > 0.0F) || layers.length <= 1) {
++            return layers;
++        }
++        if (!quireApproxLogged) {
++            quireApproxLogged = true;
++            com.mojang.logging.LogUtils.getLogger().warn("[Quire] approximate world generation is ON (quire.gen.approx={}): terrain differs slightly from vanilla", QUIRE_APPROX);
++        }
++        float total = 0.0F;
++        final float[] weight = new float[layers.length];
++        for (int i = 0; i < layers.length; i++) {
++            weight[i] = Math.abs(layers[i].amplitude) * Math.max(Math.abs(layers[i].noise.range().min()), Math.abs(layers[i].noise.range().max()));
++            total += weight[i];
++        }
++        final Integer[] order = new Integer[layers.length];
++        for (int i = 0; i < order.length; i++) {
++            order[i] = i;
++        }
++        java.util.Arrays.sort(order, (a, c) -> Float.compare(weight[a], weight[c]));
++        final boolean[] drop = new boolean[layers.length];
++        float dropped = 0.0F;
++        for (int k = 0; k < order.length - 1; k++) { // always keep the strongest layer
++            final int i = order[k];
++            if (dropped + weight[i] > QUIRE_APPROX * total) {
++                break;
++            }
++            dropped += weight[i];
++            drop[i] = true;
++        }
++        final java.util.List<NoiseStack.Layer> kept = new java.util.ArrayList<>();
++        for (int i = 0; i < layers.length; i++) {
++            if (!drop[i]) {
++                kept.add(layers[i]);
++            }
++        }
++        return kept.toArray(NoiseStack.Layer[]::new);
++    }
++    // Quire end - approximate generation
++
+     private static class Perlin extends NoiseStack {
+         private Perlin(final NoiseStack.Layer[] layers) {
+             super(layers);

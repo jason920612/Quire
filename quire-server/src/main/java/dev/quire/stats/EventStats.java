@@ -23,7 +23,7 @@ public final class EventStats {
     /** Set by the server while a world is being ticked. */
     public static volatile boolean inLevelTick;
 
-    private static final Map<Class<?>, Entry> ENTRIES = new ConcurrentHashMap<>();
+    private static final Map<String, Entry> ENTRIES = new ConcurrentHashMap<>(); // by class name: must not pin plugin classloaders
     private static volatile long startNanos = System.nanoTime();
     private static final LongAdder TICKS = new LongAdder();
 
@@ -43,7 +43,7 @@ public final class EventStats {
     }
 
     public static void record(final Event event, final RegisteredListener[] listeners, final long listenerNanos) {
-        final Entry e = ENTRIES.computeIfAbsent(event.getClass(), k -> new Entry());
+        final Entry e = ENTRIES.computeIfAbsent(event.getClass().getName(), k -> new Entry());
         e.calls.increment();
         if (listeners.length > 0) {
             e.callsWithListeners.increment();
@@ -66,15 +66,15 @@ public final class EventStats {
     public static void dump(final Path file) throws IOException {
         final long ticks = Math.max(1, TICKS.sum());
         final double seconds = (System.nanoTime() - startNanos) / 1e9;
-        final List<Map.Entry<Class<?>, Entry>> list = new ArrayList<>(ENTRIES.entrySet());
+        final List<Map.Entry<String, Entry>> list = new ArrayList<>(ENTRIES.entrySet());
         list.sort((a, b) -> Long.compare(b.getValue().callsWithListeners.sum(), a.getValue().callsWithListeners.sum()));
         final StringBuilder sb = new StringBuilder();
         sb.append(String.format("ticks=%d seconds=%.1f%n", ticks, seconds));
         sb.append(String.format("%-48s %12s %14s %18s %12s  %s%n", "event", "calls/tick", "listened/tick", "inLevelTick/tick", "us/tick", "plugins"));
-        for (final Map.Entry<Class<?>, Entry> me : list) {
+        for (final Map.Entry<String, Entry> me : list) {
             final Entry e = me.getValue();
             sb.append(String.format("%-48s %12.2f %14.2f %18.2f %12.1f  %s%n",
-                me.getKey().getSimpleName(),
+                me.getKey().substring(me.getKey().lastIndexOf('.') + 1),
                 e.calls.sum() / (double) ticks,
                 e.callsWithListeners.sum() / (double) ticks,
                 e.callsWithListenersInLevelTick.sum() / (double) ticks,

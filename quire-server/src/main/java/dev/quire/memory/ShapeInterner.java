@@ -52,6 +52,7 @@ public final class ShapeInterner {
     }
 
     private static final ConcurrentHashMap<Key, VoxelShape> SHAPES = new ConcurrentHashMap<>();
+    private static final int MAX_SHAPES = Integer.getInteger("quire.shapeInterner.max", 200_000);
 
     private ShapeInterner() {
     }
@@ -59,6 +60,9 @@ public final class ShapeInterner {
     public static VoxelShape intern(final VoxelShape shape) {
         if (!ENABLED || shape.isEmpty() || shape == Shapes.block()) {
             return shape.isEmpty() && ENABLED ? Shapes.empty() : shape;
+        }
+        if (SHAPES.size() >= MAX_SHAPES) {
+            return shape; // shapes made at runtime (dynamic block shapes) must not grow this without bound
         }
         final Key key = Key.of(shape);
         final VoxelShape existing = SHAPES.putIfAbsent(key, shape);
