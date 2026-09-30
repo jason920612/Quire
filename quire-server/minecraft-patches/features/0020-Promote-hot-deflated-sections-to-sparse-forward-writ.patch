@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 15:08:23 +0800
+Subject: [PATCH] Promote hot deflated sections to sparse; forward writers to
+ the installed storage
+
+
+diff --git a/net/minecraft/world/level/chunk/PalettedContainer.java b/net/minecraft/world/level/chunk/PalettedContainer.java
+index 84d3fd8f9cf0b96dd516828944ce2e1e55b65e89..9e0feadb57750749145d845fe54d928dfdea39f2 100644
+--- a/net/minecraft/world/level/chunk/PalettedContainer.java
++++ b/net/minecraft/world/level/chunk/PalettedContainer.java
+@@ -35,9 +35,14 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+     private boolean quireEncoding; // a snapshot is being encoded off-thread
+ 
+     @Override
+-    public synchronized SimpleBitStorage quire$inflate(final dev.quire.memory.FrozenBitStorage compressed) {
++    public synchronized SimpleBitStorage quire$inflate(dev.quire.memory.FrozenBitStorage compressed) {
++        // Quire - a writer may hold a storage that was since replaced by an equivalent frozen one: follow it, so the
++        // write lands in the installed storage
++        PalettedContainer.Data<T> current = this.data;
++        while (current.storage != compressed && compressed.successor != null) {
++            compressed = compressed.successor;
++        }
+         final SimpleBitStorage live = compressed.inflateForOwner();
+-        final PalettedContainer.Data<T> current = this.data;
+         if (current.storage == compressed) {
+             final PalettedContainer.Data<T> inflated = new PalettedContainer.Data<>(current.configuration, live, current.palette);
+             this.updateData(inflated);
+@@ -54,6 +59,25 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         return live;
+     }
+ 
++    @Override
++    public synchronized int quire$promote(final dev.quire.memory.FrozenBitStorage frozen, final int index) {
++        final PalettedContainer.Data<T> current = this.data;
++        if (!dev.quire.memory.SectionCompression.SPARSE || current.storage != frozen || !(frozen instanceof dev.quire.memory.CompressedBitStorage)) {
++            return -1;
++        }
++        final dev.quire.memory.SparseBitStorage sparse = dev.quire.memory.SparseBitStorage.encode(this,
++            new SimpleBitStorage(frozen.getBits(), frozen.getSize(), frozen.getRaw()), dev.quire.memory.SectionCompression.SPARSE_MAX_RATIO);
++        if (sparse == null) {
++            return -1;
++        }
++        frozen.successor = sparse;
++        final PalettedContainer.Data<T> promoted = new PalettedContainer.Data<>(current.configuration, sparse, current.palette);
++        this.updateData(promoted);
++        this.data = promoted;
++        dev.quire.memory.SectionCompression.PROMOTED.increment();
++        return sparse.peek(index);
++    }
++
+     /** Read-only access for bulk scanners (lighting): never inflates a compressed container. */
+     public T quire$peek(final int x, final int y, final int z) {
+         return this.quire$peek(this.strategy.getIndex(x, y, z));
+@@ -125,6 +149,31 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         return this.data.storage instanceof SimpleBitStorage storage ? storage : null;
+     }
+ 
++    /** The sparse storage, if this container holds one and no encoding is in flight (marks it in flight). */
++    public synchronized dev.quire.memory.SparseBitStorage quire$sparseForReencoding() {
++        if (this.quireEncoding || !(this.data.storage instanceof dev.quire.memory.SparseBitStorage sparse)) {
++            return null;
++        }
++        this.quireEncoding = true;
++        return sparse;
++    }
++
++    /** Installs an off-thread re-encoding of an immutable frozen storage if it is still the installed one. */
++    public synchronized boolean quire$installReencoded(final dev.quire.memory.FrozenBitStorage expected, final dev.quire.memory.FrozenBitStorage frozen) {
++        this.quireEncoding = false;
++        final PalettedContainer.Data<T> current = this.data;
++        if (frozen == null || current.storage != expected) {
++            return false;
++        }
++        expected.successor = frozen; // Quire - writers holding the sparse storage follow it
++        dev.quire.memory.SectionCompression.COMPRESSED.increment();
++        dev.quire.memory.SectionCompression.PACKED_BYTES.add(frozen.packedBytes());
++        final PalettedContainer.Data<T> compressed = new PalettedContainer.Data<>(current.configuration, frozen, current.palette);
++        this.updateData(compressed);
++        this.data = compressed;
++        return true;
++    }
++
+     /** Installs an encoding made off-thread from {@code snapshot} if the storage is still {@code expected} with the same contents. */
+     public synchronized boolean quire$installEncoded(final SimpleBitStorage expected, final long[] snapshot, final dev.quire.memory.FrozenBitStorage frozen) {
+         this.quireEncoding = false;

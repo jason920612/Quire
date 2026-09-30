@@ -18,6 +18,11 @@ public abstract class FrozenBitStorage implements BitStorage {
     public interface Owner {
         /** Inflates (once) the frozen storage currently installed, returning the live storage. */
         SimpleBitStorage quire$inflate(FrozenBitStorage frozen);
+
+        /** Replaces a hot deflated storage by a sparse one and returns entry {@code index}, or -1 if not done. */
+        default int quire$promote(final FrozenBitStorage frozen, final int index) {
+            return -1;
+        }
     }
 
     protected final Owner owner;
@@ -25,6 +30,8 @@ public abstract class FrozenBitStorage implements BitStorage {
     protected final int size;
     protected final int rawLength;
     protected volatile SimpleBitStorage inflated;
+    /** Set when the owner replaced this storage by an equivalent frozen one (a writer holding this one follows it). */
+    public volatile FrozenBitStorage successor;
 
     protected FrozenBitStorage(final Owner owner, final int bits, final int size, final int rawLength) {
         this.owner = owner;

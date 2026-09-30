@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 11:33:39 +0800
+Subject: [PATCH] Compact advancement progress storage
+
+Criterion names are stored once per requirements; each player keeps only
+an array of progress objects, shared while nothing is obtained.
+
+diff --git a/net/minecraft/advancements/AdvancementProgress.java b/net/minecraft/advancements/AdvancementProgress.java
+index b6ca9b6303a8201bdbbc7c224998fdad9dff8a4f..9e14bbaa8a83236487ad750cfe42aa74cec4c7ef 100644
+--- a/net/minecraft/advancements/AdvancementProgress.java
++++ b/net/minecraft/advancements/AdvancementProgress.java
+@@ -1,7 +1,6 @@
+ package net.minecraft.advancements;
+ 
+ import com.google.common.collect.Lists;
+-import com.google.common.collect.Maps;
+ import com.mojang.serialization.Codec;
+ import com.mojang.serialization.codecs.RecordCodecBuilder;
+ import io.netty.buffer.ByteBuf;
+@@ -38,32 +37,127 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+         );
+     public static final Codec<AdvancementProgress> CODEC = RecordCodecBuilder.create(
+         i -> i.group(
+-                CRITERIA_CODEC.optionalFieldOf("criteria", Map.of()).forGetter(a -> a.criteria),
++                CRITERIA_CODEC.optionalFieldOf("criteria", Map.of()).forGetter(AdvancementProgress::quire$criteriaMap), // Quire - compact storage
+                 ExtraCodecs.optionalAlwaysPresentFieldOf(Codec.BOOL, "done", true).forGetter(AdvancementProgress::isDone)
+             )
+             .apply(i, (criteria, done) -> new AdvancementProgress(new HashMap<>(criteria)))
+     );
+     public static final StreamCodec<ByteBuf, AdvancementProgress> STREAM_CODEC = StreamCodec.composite(
+-        ByteBufCodecs.map(HashMap::new, ByteBufCodecs.STRING_UTF8, CriterionProgress.STREAM_CODEC), a -> a.criteria, AdvancementProgress::new
++        ByteBufCodecs.map(HashMap::new, ByteBufCodecs.STRING_UTF8, CriterionProgress.STREAM_CODEC), AdvancementProgress::quire$criteriaMap, AdvancementProgress::new // Quire - compact storage
+     );
+-    private final Map<String, CriterionProgress> criteria;
++
++    // Quire start - compact storage
++    // Every online player holds a progress object for every advancement (~1900, mostly recipe unlocks), each with
++    // a HashMap of criteria: most of a large server's per-player memory. Criterion names are stored once per
++    // requirements (shared array, in the iteration order the vanilla HashMap had); per player there is only an
++    // array of progress objects, and a progress with nothing obtained shares one read-only array.
++    // CriterionProgress objects are only changed here (grant/revoke replace the slot), so shared ones never change.
++    private static final class NotDone extends CriterionProgress {
++        @Override
++        public void grant() {
++            throw new UnsupportedOperationException("shared criterion progress; use AdvancementProgress.grantProgress");
++        }
++
++        @Override
++        public void revoke() {
++            throw new UnsupportedOperationException("shared criterion progress; use AdvancementProgress.revokeProgress");
++        }
++    }
++
++    private static final CriterionProgress NOT_DONE = new NotDone();
++    private static final String[] NO_KEYS = new String[0];
++    private static final CriterionProgress[] NO_VALUES = new CriterionProgress[0];
++
++    private record Layout(String[] keys, CriterionProgress[] notDone) {}
++
++    private static final java.util.concurrent.ConcurrentHashMap<AdvancementRequirements, Layout> LAYOUTS = new java.util.concurrent.ConcurrentHashMap<>();
++
++    private static Layout layout(final AdvancementRequirements requirements) {
++        return LAYOUTS.computeIfAbsent(requirements, r -> {
++            // vanilla filled a HashMap with putIfAbsent in names() order; keep its iteration order
++            final Map<String, Boolean> order = new HashMap<>();
++            for (final String name : r.names()) {
++                order.putIfAbsent(name, Boolean.TRUE);
++            }
++            final String[] keys = order.keySet().toArray(new String[0]);
++            final CriterionProgress[] notDone = new CriterionProgress[keys.length];
++            java.util.Arrays.fill(notDone, NOT_DONE);
++            return new Layout(keys, notDone);
++        });
++    }
++
++    private String[] keys;
++    private CriterionProgress[] values; // may be the layout's shared all-not-done array: copy before writing
++    private boolean sharedValues;
++
++    private int indexOf(final String name) {
++        final String[] keys = this.keys;
++        for (int i = 0; i < keys.length; i++) {
++            if (keys[i].equals(name)) {
++                return i;
++            }
++        }
++        return -1;
++    }
++
++    private void set(final int index, final CriterionProgress progress) {
++        if (this.sharedValues) {
++            this.values = this.values.clone();
++            this.sharedValues = false;
++        }
++        this.values[index] = progress;
++    }
++
++    /** The criteria as a map (for serialization), in iteration order. */
++    public Map<String, CriterionProgress> quire$criteriaMap() {
++        final Map<String, CriterionProgress> map = new java.util.LinkedHashMap<>(Math.max(2, this.keys.length * 2));
++        for (int i = 0; i < this.keys.length; i++) {
++            map.put(this.keys[i], this.values[i]);
++        }
++        return map;
++    }
++    // Quire end - compact storage
++
+     private AdvancementRequirements requirements = AdvancementRequirements.EMPTY;
+ 
+     private AdvancementProgress(final Map<String, CriterionProgress> criteria) {
+-        this.criteria = criteria;
++        // Quire start - compact storage
++        this.keys = criteria.keySet().toArray(new String[0]);
++        this.values = new CriterionProgress[this.keys.length];
++        for (int i = 0; i < this.keys.length; i++) {
++            final CriterionProgress progress = criteria.get(this.keys[i]);
++            this.values[i] = progress == null || !progress.isDone() ? NOT_DONE : progress;
++        }
++        // Quire end - compact storage
+     }
+ 
+     public AdvancementProgress() {
+-        this.criteria = Maps.newHashMap();
++        // Quire start - compact storage
++        this.keys = NO_KEYS;
++        this.values = NO_VALUES;
++        // Quire end - compact storage
+     }
+ 
+     public void update(final AdvancementRequirements requirements) {
+-        Set<String> names = requirements.names();
+-        this.criteria.entrySet().removeIf(entry -> !names.contains(entry.getKey()));
+-
+-        for (String name : names) {
+-            this.criteria.putIfAbsent(name, new CriterionProgress());
++        // Quire start - compact storage: drop criteria not in the requirements, add missing ones as not done
++        final Layout layout = layout(requirements);
++        final String[] keys = layout.keys();
++        CriterionProgress[] values = layout.notDone();
++        boolean shared = true;
++        for (int i = 0; i < keys.length; i++) {
++            final int old = this.indexOf(keys[i]);
++            if (old >= 0 && this.values[old] != NOT_DONE) {
++                if (shared) {
++                    values = values.clone();
++                    shared = false;
++                }
++                values[i] = this.values[old];
++            }
+         }
++        this.keys = keys;
++        this.values = values;
++        this.sharedValues = shared;
++        // Quire end - compact storage
+ 
+         this.requirements = requirements;
+     }
+@@ -73,7 +167,7 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     }
+ 
+     public boolean hasProgress() {
+-        for (CriterionProgress progress : this.criteria.values()) {
++        for (CriterionProgress progress : this.values) { // Quire - compact storage
+             if (progress.isDone()) {
+                 return true;
+             }
+@@ -83,9 +177,9 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     }
+ 
+     public boolean grantProgress(final String name) {
+-        CriterionProgress progress = this.criteria.get(name);
+-        if (progress != null && !progress.isDone()) {
+-            progress.grant();
++        final int index = this.indexOf(name); // Quire - compact storage
++        if (index >= 0 && !this.values[index].isDone()) {
++            this.set(index, new CriterionProgress(Instant.now())); // Quire - same as grant()
+             return true;
+         } else {
+             return false;
+@@ -93,9 +187,9 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     }
+ 
+     public boolean revokeProgress(final String name) {
+-        CriterionProgress progress = this.criteria.get(name);
+-        if (progress != null && progress.isDone()) {
+-            progress.revoke();
++        final int index = this.indexOf(name); // Quire - compact storage
++        if (index >= 0 && this.values[index].isDone()) {
++            this.set(index, NOT_DONE); // Quire - same as revoke()
+             return true;
+         } else {
+             return false;
+@@ -104,11 +198,12 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+ 
+     @Override
+     public String toString() {
+-        return "AdvancementProgress{criteria=" + this.criteria + ", requirements=" + this.requirements + "}";
++        return "AdvancementProgress{criteria=" + this.quire$criteriaMap() + ", requirements=" + this.requirements + "}"; // Quire - compact storage
+     }
+ 
+     public @Nullable CriterionProgress getCriterion(final String id) {
+-        return this.criteria.get(id);
++        final int index = this.indexOf(id); // Quire - compact storage
++        return index >= 0 ? this.values[index] : null;
+     }
+ 
+     private boolean isCriterionDone(final String criterion) {
+@@ -117,7 +212,7 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     }
+ 
+     public float getPercent() {
+-        if (this.criteria.isEmpty()) {
++        if (this.keys.length == 0) { // Quire - compact storage
+             return 0.0F;
+         }
+ 
+@@ -127,7 +222,7 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     }
+ 
+     public @Nullable Component getProgressText() {
+-        if (this.criteria.isEmpty()) {
++        if (this.keys.length == 0) { // Quire - compact storage
+             return null;
+         }
+ 
+@@ -147,9 +242,9 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     public Iterable<String> getRemainingCriteria() {
+         List<String> remaining = Lists.newArrayList();
+ 
+-        for (Entry<String, CriterionProgress> entry : this.criteria.entrySet()) {
+-            if (!entry.getValue().isDone()) {
+-                remaining.add(entry.getKey());
++        for (int i = 0; i < this.keys.length; i++) { // Quire - compact storage
++            if (!this.values[i].isDone()) {
++                remaining.add(this.keys[i]);
+             }
+         }
+ 
+@@ -159,9 +254,9 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     public Iterable<String> getCompletedCriteria() {
+         List<String> completed = Lists.newArrayList();
+ 
+-        for (Entry<String, CriterionProgress> entry : this.criteria.entrySet()) {
+-            if (entry.getValue().isDone()) {
+-                completed.add(entry.getKey());
++        for (int i = 0; i < this.keys.length; i++) { // Quire - compact storage
++            if (this.values[i].isDone()) {
++                completed.add(this.keys[i]);
+             }
+         }
+ 
+@@ -169,7 +264,7 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+     }
+ 
+     public @Nullable Instant getFirstProgressDate() {
+-        return this.criteria.values().stream().map(CriterionProgress::getObtained).filter(Objects::nonNull).min(Comparator.naturalOrder()).orElse(null);
++        return java.util.Arrays.stream(this.values).map(CriterionProgress::getObtained).filter(Objects::nonNull).min(Comparator.naturalOrder()).orElse(null); // Quire - compact storage
+     }
+ 
+     @Override

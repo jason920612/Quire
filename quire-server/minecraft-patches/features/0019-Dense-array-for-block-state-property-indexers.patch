@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 15:08:22 +0800
+Subject: [PATCH] Dense array for block state property indexers
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/blockstate_propertyaccess/util/ZeroCollidingReferenceStateTable.java b/ca/spottedleaf/moonrise/patches/blockstate_propertyaccess/util/ZeroCollidingReferenceStateTable.java
+index 6bb4008f2a09f0acd47dc7fd21c5a6d6f2c294fd..959d3f97f39aa630b33267538daf8fa3e12c2d21 100644
+--- a/ca/spottedleaf/moonrise/patches/blockstate_propertyaccess/util/ZeroCollidingReferenceStateTable.java
++++ b/ca/spottedleaf/moonrise/patches/blockstate_propertyaccess/util/ZeroCollidingReferenceStateTable.java
+@@ -14,6 +14,13 @@ import net.minecraft.world.level.block.state.properties.Property;
+ public final class ZeroCollidingReferenceStateTable<O, S> {
+ 
+     private final Int2ObjectOpenHashMap<Indexer> propertyToIndexer;
++    // Quire - same mapping as propertyToIndexer as a dense array (property ids are small): no hashing per getValue
++    private Indexer[] indexerById = new Indexer[0];
++
++    private Indexer quire$indexer(final int id) {
++        final Indexer[] byId = this.indexerById;
++        return id >= 0 && id < byId.length ? byId[id] : null;
++    }
+     private S[] lookup;
+     private final Collection<Property<?>> properties;
+ 
+@@ -48,10 +55,21 @@ public final class ZeroCollidingReferenceStateTable<O, S> {
+ 
+             currentMultiple *= totalValues;
+         }
++
++        // Quire start - dense indexer array
++        int maxId = -1;
++        for (final int id : this.propertyToIndexer.keySet()) {
++            maxId = Math.max(maxId, id);
++        }
++        this.indexerById = new Indexer[maxId + 1];
++        for (final Int2ObjectOpenHashMap.Entry<Indexer> entry : this.propertyToIndexer.int2ObjectEntrySet()) {
++            this.indexerById[entry.getIntKey()] = entry.getValue();
++        }
++        // Quire end - dense indexer array
+     }
+ 
+     public <T extends Comparable<T>> boolean hasProperty(final Property<T> property) {
+-        return this.propertyToIndexer.containsKey(((PropertyAccess<T>)property).moonrise$getId());
++        return this.quire$indexer(((PropertyAccess<T>)property).moonrise$getId()) != null; // Quire - dense indexer array
+     }
+ 
+     public long getIndex(final StateHolder<O, S> stateHolder, final Property<?>[] keys, final Comparable<?>[] values) {
+@@ -61,7 +79,7 @@ public final class ZeroCollidingReferenceStateTable<O, S> {
+             final Property<?> property = keys[i];
+             final Comparable<?> value = values[i];
+ 
+-            final Indexer indexer = this.propertyToIndexer.get(((PropertyAccess<?>)property).moonrise$getId());
++            final Indexer indexer = this.quire$indexer(((PropertyAccess<?>)property).moonrise$getId()); // Quire - dense indexer array
+ 
+             ret += ((long)((PropertyAccess)property).moonrise$getIdFor(value)) * (long)indexer.multiple;
+         }
+@@ -95,7 +113,7 @@ public final class ZeroCollidingReferenceStateTable<O, S> {
+     }
+ 
+     public <T extends Comparable<T>> T get(final long index, final Property<T> property) {
+-        final Indexer indexer = this.propertyToIndexer.get(((PropertyAccess<T>)property).moonrise$getId());
++        final Indexer indexer = this.quire$indexer(((PropertyAccess<T>)property).moonrise$getId()); // Quire - dense indexer array
+         if (indexer == null) {
+             return null;
+         }
+@@ -114,7 +132,7 @@ public final class ZeroCollidingReferenceStateTable<O, S> {
+             return null;
+         }
+ 
+-        final Indexer indexer = this.propertyToIndexer.get(((PropertyAccess<T>)property).moonrise$getId());
++        final Indexer indexer = this.quire$indexer(((PropertyAccess<T>)property).moonrise$getId()); // Quire - dense indexer array
+         if (indexer == null) {
+             return null;
+         }
+@@ -131,7 +149,7 @@ public final class ZeroCollidingReferenceStateTable<O, S> {
+     }
+ 
+     public <T extends Comparable<T>> S trySet(final long index, final Property<T> property, final T with, final S dfl) {
+-        final Indexer indexer = this.propertyToIndexer.get(((PropertyAccess<T>)property).moonrise$getId());
++        final Indexer indexer = this.quire$indexer(((PropertyAccess<T>)property).moonrise$getId()); // Quire - dense indexer array
+         if (indexer == null) {
+             return dfl;
+         }

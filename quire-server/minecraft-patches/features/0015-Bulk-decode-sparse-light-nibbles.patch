@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 11:33:40 +0800
+Subject: [PATCH] Bulk-decode sparse light nibbles
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+index 25dc95879b6e593ddae8bffc6800667c02d84bce..37a0deea7e48991763be56459bda0e742f82646b 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+@@ -104,8 +104,10 @@ public final class SWMRNibbleArray {
+ 
+     private static byte[] decode(final dev.quire.memory.Sparse4096 sparse) {
+         final byte[] bytes = new byte[ARRAY_SIZE];
++        final int[] values = new int[4096];
++        sparse.decodeAll(values);
+         for (int i = 0; i < ARRAY_SIZE; ++i) {
+-            bytes[i] = (byte)(sparse.get(i << 1) | (sparse.get((i << 1) | 1) << 4));
++            bytes[i] = (byte)(values[i << 1] | (values[(i << 1) | 1] << 4));
+         }
+         return bytes;
+     }

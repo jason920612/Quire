@@ -30,7 +30,30 @@ public final class SectionCompactor {
     public static final LongAdder PASSES = new LongAdder();
     public static final LongAdder DISCARDED = new LongAdder();
 
-    private record Job(PalettedContainer<?> container, SimpleBitStorage expected, long[] snapshot) {}
+    // expected/snapshot: plain storage to encode; frozen: sparse storage to re-encode; deflate: target encoding
+    private record Job(PalettedContainer<?> container, SimpleBitStorage expected, long[] snapshot, FrozenBitStorage frozen, boolean deflate) {}
+
+    /**
+     * Sections of loaded but not ticking chunks (outside simulation distance) are deflated instead (~2.5x smaller than sparse).
+     * Off by default: with moving players chunks keep crossing the ticking boundary and the churn cost more than it saved.
+     */
+    private static final boolean COLD_DEFLATE = Boolean.getBoolean("quire.compressSections.coldDeflate");
+
+    private static FrozenBitStorage encode(final Job job) {
+        final long[] raw = job.snapshot() != null ? job.snapshot() : job.frozen().getRaw();
+        final int bits = job.expected() != null ? job.expected().getBits() : job.frozen().getBits();
+        final int size = job.expected() != null ? job.expected().getSize() : job.frozen().getSize();
+        if (job.deflate()) {
+            final byte[] packed = SectionCompression.deflate(raw);
+            if (packed != null) {
+                return new CompressedBitStorage(job.container(), packed, bits, size, raw.length);
+            }
+            if (job.frozen() != null) {
+                return null; // keep the sparse form
+            }
+        }
+        return SparseBitStorage.encode(job.container(), new SimpleBitStorage(bits, size, raw), SectionCompression.SPARSE_MAX_RATIO);
+    }
     private record Result(Job job, FrozenBitStorage frozen) {}
 
     private static final AtomicInteger IN_FLIGHT = new AtomicInteger();
@@ -77,6 +100,7 @@ public final class SectionCompactor {
                 if (chunk == null) {
                     continue;
                 }
+                final boolean cold = COLD_DEFLATE && SectionCompression.SPARSE && chunk.getFullStatus() == net.minecraft.server.level.FullChunkStatus.FULL;
                 for (final LevelChunkSection section : chunk.getSections()) {
                     final PalettedContainer<?> states = section.getStates();
                     if (states.quireHotUntil != 0 && now - states.quireHotUntil <= 0) {
@@ -86,21 +110,28 @@ public final class SectionCompactor {
                         states.quire$compress();
                         continue;
                     }
+                    final Job job;
                     final SimpleBitStorage expected = states.quire$plainStorage();
-                    if (expected == null) {
+                    if (expected != null) {
+                        final long[] snapshot = states.quire$snapshotForEncoding();
+                        if (snapshot == null) {
+                            continue;
+                        }
+                        job = new Job(states, expected, snapshot, null, cold);
+                    } else if (cold) {
+                        final SparseBitStorage sparse = states.quire$sparseForReencoding();
+                        if (sparse == null) {
+                            continue;
+                        }
+                        job = new Job(states, null, null, sparse, true);
+                    } else {
                         continue;
                     }
-                    final long[] snapshot = states.quire$snapshotForEncoding();
-                    if (snapshot == null) {
-                        continue;
-                    }
-                    final Job job = new Job(states, expected, snapshot);
                     IN_FLIGHT.incrementAndGet();
                     ENCODER.execute(() -> {
                         FrozenBitStorage frozen = null;
                         try {
-                            frozen = SparseBitStorage.encode(job.container(), new SimpleBitStorage(job.expected().getBits(), job.expected().getSize(), job.snapshot()),
-                                SectionCompression.SPARSE_MAX_RATIO);
+                            frozen = encode(job);
                         } finally {
                             RESULTS.add(new Result(job, frozen));
                         }
@@ -116,7 +147,10 @@ public final class SectionCompactor {
         while ((result = RESULTS.poll()) != null) {
             IN_FLIGHT.decrementAndGet();
             final Job job = result.job();
-            if (!job.container().quire$installEncoded(job.expected(), job.snapshot(), result.frozen()) && result.frozen() != null) {
+            final boolean installed = job.frozen() != null
+                ? job.container().quire$installReencoded(job.frozen(), result.frozen())
+                : job.container().quire$installEncoded(job.expected(), job.snapshot(), result.frozen());
+            if (!installed && result.frozen() != null) {
                 DISCARDED.increment();
             }
             if ((++n & 63) == 0 && System.nanoTime() > deadline) {

@@ -44,7 +44,12 @@ public final class CompressedBitStorage extends FrozenBitStorage {
             this.peekMisses = 0;
         }
         if (++this.peekMisses >= PROMOTE_AFTER_MISSES) {
-            return this.owner.quire$inflate(this).get(index); // read repeatedly: it is hot
+            // read repeatedly: it is hot. Prefer a sparse (compact, cheap to read) form over a plain one
+            final int value = this.owner.quire$promote(this, index);
+            if (value >= 0) {
+                return value;
+            }
+            return this.owner.quire$inflate(this).get(index);
         }
         return this.readSingle(index);
     }

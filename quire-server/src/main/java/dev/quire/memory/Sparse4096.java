@@ -181,6 +181,55 @@ public final class Sparse4096 {
         return unpack(blob, payload + 9 + rank * this.bits, ((y & 1) << 2) | ((z & 1) << 1) | (x & 1), this.bits);
     }
 
+    /** All 4096 values (index {@code x | z << 4 | y << 8}), decoded block by block. */
+    public void decodeAll(final int[] out) {
+        final byte[] blob = this.blob;
+        final long mixedBlocks = this.mixedBlocks;
+        final int payloadBase = 64 + Long.bitCount(mixedBlocks) * MIXED_ENTRY;
+        for (int blk = 0; blk < 64; blk++) {
+            final int bx = (blk & 3) << 2, bz = ((blk >> 2) & 3) << 2, by = (blk >> 4) << 2;
+            if ((mixedBlocks & (1L << blk)) == 0L) {
+                final int value = blob[blk] & 0xFF;
+                for (int y = by; y < by + 4; y++) {
+                    for (int z = bz; z < bz + 4; z++) {
+                        final int row = (y << 8) | (z << 4) | bx;
+                        out[row] = value;
+                        out[row + 1] = value;
+                        out[row + 2] = value;
+                        out[row + 3] = value;
+                    }
+                }
+                continue;
+            }
+            final int e = 64 + (blob[blk] & 0xFF) * MIXED_ENTRY;
+            final int payload = payloadBase + ((blob[e] & 0xFF) | ((blob[e + 1] & 0xFF) << 8));
+            final int k = blob[e + 2];
+            if (k != 0) {
+                final int data = payload + (1 << k);
+                for (int i = 0; i < 64; i++) {
+                    out[((by + (i >> 4)) << 8) | ((bz + ((i >> 2) & 3)) << 4) | (bx + (i & 3))] = blob[payload + unpack(blob, data, i, k)] & 0xFF;
+                }
+                continue;
+            }
+            final int cellMask = blob[payload] & 0xFF;
+            int group = payload + 9;
+            for (int c = 0; c < 8; c++) {
+                final int cx = bx + ((c & 1) << 1), cz = bz + (((c >> 1) & 1) << 1), cy = by + ((c >> 2) << 1);
+                if ((cellMask & (1 << c)) == 0) {
+                    final int value = blob[payload + 1 + c] & 0xFF;
+                    for (int j = 0; j < 8; j++) {
+                        out[((cy + (j >> 2)) << 8) | ((cz + ((j >> 1) & 1)) << 4) | (cx + (j & 1))] = value;
+                    }
+                } else {
+                    for (int j = 0; j < 8; j++) {
+                        out[((cy + (j >> 2)) << 8) | ((cz + ((j >> 1) & 1)) << 4) | (cx + (j & 1))] = unpack(blob, group, j, this.bits);
+                    }
+                    group += this.bits;
+                }
+            }
+        }
+    }
+
     public int bytes() {
         return this.blob.length;
     }

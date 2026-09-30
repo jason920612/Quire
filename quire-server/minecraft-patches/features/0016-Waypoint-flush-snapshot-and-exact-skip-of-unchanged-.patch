@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 15:08:22 +0800
+Subject: [PATCH] Waypoint flush snapshot and exact skip of unchanged sources
+
+Per-player inputs of the pair check are copied into flat arrays per flush;
+a source whose block did not change, with only block connections, in a
+flush where no pair can be ignored, cannot change any connection and is
+skipped (verify with -Dquire.waypoints.verify).
+
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 53ff045a38eae1180d59b2edcf6815e33ec7ac8e..609d80fd53d1f50bf75229929122949e7e82efbf 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -211,6 +211,12 @@ import org.jspecify.annotations.Nullable;
+ import org.slf4j.Logger;
+ 
+ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer { // Paper - rewrite chunk system
++    public int quireWaypointSlot = -1; // Quire - waypoint flush snapshot slot (ServerWaypointManager)
++    public int quireTrackSlot = -1; // Quire - entity tracker snapshot slot (ChunkMap)
++    // Quire start - waypoint skip bookkeeping (ServerWaypointManager)
++    public int quireWpNonBlockIn, quireWpNonBlockOut; // connections that are not block connections, as receiver / as source
++    public net.minecraft.core.@org.jspecify.annotations.Nullable BlockPos quireWpLastBlock; // block position at the last full evaluation as a source
++    // Quire end
+     private static final Logger LOGGER = LogUtils.getLogger();
+     public long lastSave = MinecraftServer.currentTick; // Paper - Incremental chunk and player saving
+     private static final int NEUTRAL_MOB_DEATH_NOTIFICATION_RADII_XZ = 32;
+diff --git a/net/minecraft/server/waypoints/ServerWaypointManager.java b/net/minecraft/server/waypoints/ServerWaypointManager.java
+index 3855fa7723f95c5b38b08aacc8af02b3e6e76168..5c5af83fc92d7e16cb49b41cd8c7db129e7a1efa 100644
+--- a/net/minecraft/server/waypoints/ServerWaypointManager.java
++++ b/net/minecraft/server/waypoints/ServerWaypointManager.java
+@@ -34,9 +34,29 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     }
+ 
+     private void putConnection(final ServerPlayer player, final WaypointTransmitter waypoint, final WaypointTransmitter.Connection connection) {
+-        this.byPlayer.computeIfAbsent(player, k -> new LinkedHashMap<>()).put(waypoint, connection);
++        quire$tagConnection(player, connection); // Quire - flush snapshot
++        final WaypointTransmitter.Connection old = this.byPlayer.computeIfAbsent(player, k -> new LinkedHashMap<>()).put(waypoint, connection);
+         this.byWaypoint.computeIfAbsent(waypoint, k -> new LinkedHashMap<>()).put(player, connection);
++        // Quire start - waypoint skip bookkeeping
++        quire$count(player, waypoint, old, -1);
++        quire$count(player, waypoint, connection, 1);
++        if (waypoint instanceof ServerPlayer source) {
++            source.quireWpLastBlock = null; // new connection outside a full evaluation of the source
++        }
++        // Quire end
++    }
++
++    // Quire start - waypoint skip bookkeeping
++    private static void quire$count(final ServerPlayer receiver, final WaypointTransmitter waypoint, final WaypointTransmitter.@org.jspecify.annotations.Nullable Connection connection, final int delta) {
++        if (connection == null || connection instanceof WaypointTransmitter.EntityBlockConnection) {
++            return;
++        }
++        receiver.quireWpNonBlockIn += delta;
++        if (waypoint instanceof ServerPlayer source) {
++            source.quireWpNonBlockOut += delta;
++        }
+     }
++    // Quire end
+ 
+     private WaypointTransmitter.@org.jspecify.annotations.Nullable Connection removeConnection(final ServerPlayer player, final WaypointTransmitter waypoint) {
+         final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(player);
+@@ -47,6 +67,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         if (removed == null) {
+             return null;
+         }
++        quire$count(player, waypoint, removed, -1); // Quire - waypoint skip bookkeeping
+         if (row.isEmpty()) {
+             this.byPlayer.remove(player);
+         }
+@@ -80,6 +101,186 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         }
+     }
+ 
++    // Quire start - flush snapshot
++    // Per-pair checks used to chase 6-10 scattered objects of the receiver (Bukkit wrapper, visibility map, game
++    // mode, attribute map, position, passengers): memory latency, not arithmetic, dominated. At the start of a flush
++    // the per-player inputs of doesSourceIgnoreReceiver are copied into flat arrays indexed by a stable slot, and
++    // block/chunk connections of player waypoints are evaluated from them. Nothing moves during the flush.
++    private ServerPlayer[] quireSlotPlayers = new ServerPlayer[64];
++    private final it.unimi.dsi.fastutil.ints.IntArrayList quireFreeSlots = new it.unimi.dsi.fastutil.ints.IntArrayList();
++    private int quireSlotCount;
++    private double[] quireX = new double[64], quireY = new double[64], quireZ = new double[64], quireTx = new double[64], quireRx = new double[64];
++    private boolean[] quireSpectator = new boolean[64], quireNoOverrides = new boolean[64], quireVisibleByDefault = new boolean[64], quireHasVehicle = new boolean[64];
++    private boolean quireSnapshotValid;
++    // Quire - true when no pair can be ignored this flush: nobody is a spectator, a passenger, or has hide/show
++    // overrides, everyone is visible by default, and every pair is closer than the smallest range
++    private boolean quireAllClean;
++
++    private void quire$assignSlot(final ServerPlayer player) {
++        if (player.quireWaypointSlot >= 0) {
++            return;
++        }
++        final int slot = this.quireFreeSlots.isEmpty() ? this.quireSlotCount++ : this.quireFreeSlots.popInt();
++        if (slot >= this.quireSlotPlayers.length) {
++            final int n = this.quireSlotPlayers.length * 2;
++            this.quireSlotPlayers = java.util.Arrays.copyOf(this.quireSlotPlayers, n);
++            this.quireX = java.util.Arrays.copyOf(this.quireX, n);
++            this.quireY = java.util.Arrays.copyOf(this.quireY, n);
++            this.quireZ = java.util.Arrays.copyOf(this.quireZ, n);
++            this.quireTx = java.util.Arrays.copyOf(this.quireTx, n);
++            this.quireRx = java.util.Arrays.copyOf(this.quireRx, n);
++            this.quireSpectator = java.util.Arrays.copyOf(this.quireSpectator, n);
++            this.quireNoOverrides = java.util.Arrays.copyOf(this.quireNoOverrides, n);
++            this.quireVisibleByDefault = java.util.Arrays.copyOf(this.quireVisibleByDefault, n);
++            this.quireHasVehicle = java.util.Arrays.copyOf(this.quireHasVehicle, n);
++        }
++        this.quireSlotPlayers[slot] = player;
++        player.quireWaypointSlot = slot;
++    }
++
++    private static void quire$tagConnection(final ServerPlayer receiver, final WaypointTransmitter.Connection connection) {
++        if (connection instanceof WaypointTransmitter.EntityBlockConnection block) {
++            block.quireReceiverSlot = receiver.quireWaypointSlot;
++        } else if (connection instanceof WaypointTransmitter.EntityChunkConnection chunk) {
++            chunk.quireReceiverSlot = receiver.quireWaypointSlot;
++        }
++    }
++
++    private void quire$releaseSlot(final ServerPlayer player) {
++        final int slot = player.quireWaypointSlot;
++        if (slot >= 0 && slot < this.quireSlotPlayers.length && this.quireSlotPlayers[slot] == player) {
++            this.quireSlotPlayers[slot] = null;
++            this.quireFreeSlots.add(slot);
++            player.quireWaypointSlot = -1;
++        }
++    }
++
++    private void quire$takeSnapshot() {
++        for (final ServerPlayer player : this.players) {
++            final int s = player.quireWaypointSlot;
++            if (s < 0) {
++                continue;
++            }
++            this.quireX[s] = player.getX();
++            this.quireY[s] = player.getY();
++            this.quireZ[s] = player.getZ();
++            this.quireTx[s] = player.getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.WAYPOINT_TRANSMIT_RANGE);
++            this.quireRx[s] = player.getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.WAYPOINT_RECEIVE_RANGE);
++            this.quireSpectator[s] = player.isSpectator();
++            this.quireNoOverrides[s] = player.getBukkitEntity().quire$hasNoVisibilityOverrides();
++            this.quireVisibleByDefault[s] = player.visibleByDefault;
++            this.quireHasVehicle[s] = player.isPassenger();
++        }
++        this.quireSnapshotValid = true;
++        // Quire start - waypoint skip: clean predicate
++        boolean clean = true;
++        double minRange = Double.MAX_VALUE;
++        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, minZ = Double.MAX_VALUE;
++        double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE, maxZ = -Double.MAX_VALUE;
++        for (final ServerPlayer player : this.players) {
++            final int s = player.quireWaypointSlot;
++            if (s < 0 || this.quireSpectator[s] || !this.quireNoOverrides[s] || !this.quireVisibleByDefault[s] || this.quireHasVehicle[s]) {
++                clean = false;
++                break;
++            }
++            minRange = Math.min(minRange, Math.min(this.quireTx[s], this.quireRx[s]));
++            minX = Math.min(minX, this.quireX[s]);
++            minY = Math.min(minY, this.quireY[s]);
++            minZ = Math.min(minZ, this.quireZ[s]);
++            maxX = Math.max(maxX, this.quireX[s]);
++            maxY = Math.max(maxY, this.quireY[s]);
++            maxZ = Math.max(maxZ, this.quireZ[s]);
++        }
++        if (clean && !this.players.isEmpty()) {
++            final double dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ;
++            // any pair distance^2 <= bounding box diagonal^2 < minRange^2: never ignored for range
++            clean = dx * dx + dy * dy + dz * dz < net.minecraft.util.Mth.square(minRange);
++        }
++        this.quireAllClean = !QUIRE_NO_SKIP && clean && this.waypoints.size() <= this.players.size() && this.quire$onlyPlayerWaypoints();
++        // Quire end - waypoint skip: clean predicate
++    }
++
++    private boolean quire$onlyPlayerWaypoints() {
++        for (final WaypointTransmitter waypoint : this.waypoints) {
++            if (!(waypoint instanceof ServerPlayer)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /** WaypointTransmitter.doesSourceIgnoreReceiver for two players with snapshot slots. */
++    private boolean quire$ignores(final ServerPlayer source, final int s, final ServerPlayer receiver, final int r) {
++        if (this.quireNoOverrides[r]) {
++            if (!this.quireVisibleByDefault[s]) {
++                return true; // canSee: source is not the receiver, nothing overridden -> visible by default
++            }
++        } else if (!receiver.getBukkitEntity().quire$canSee(source)) {
++            return true;
++        }
++        if (this.quireSpectator[r]) {
++            return false;
++        }
++        if (this.quireSpectator[s] || (this.quireHasVehicle[r] && source.hasIndirectPassenger(receiver))) {
++            return true;
++        }
++        final double range = Math.min(this.quireTx[s], this.quireRx[r]);
++        final double dx = this.quireX[s] - this.quireX[r];
++        final double dy = this.quireY[s] - this.quireY[r];
++        final double dz = this.quireZ[s] - this.quireZ[r];
++        return dx * dx + dy * dy + dz * dz >= net.minecraft.util.Mth.square(range);
++    }
++
++    /** isBroken() of a block/chunk connection between two players from the snapshot, or -1 if not applicable. */
++    private int quire$fastIsBroken(final ServerPlayer receiver, final WaypointTransmitter waypoint, final WaypointTransmitter.Connection connection) {
++        if (!this.quireSnapshotValid || !(waypoint instanceof ServerPlayer source) || source.quireWaypointSlot < 0) {
++            return -1;
++        }
++        if (connection instanceof WaypointTransmitter.EntityBlockConnection block && block.quireReceiverSlot >= 0) {
++            if (block.distanceManhattan() > 1) {
++                return 1;
++            }
++            return this.quire$ignores(source, source.quireWaypointSlot, receiver, block.quireReceiverSlot) ? 1 : 0;
++        }
++        if (connection instanceof WaypointTransmitter.EntityChunkConnection chunk && chunk.quireReceiverSlot >= 0) {
++            return chunk.quire$isBroken(this.quire$ignores(source, source.quireWaypointSlot, receiver, chunk.quireReceiverSlot)) ? 1 : 0;
++        }
++        return -1;
++    }
++    // Quire end - flush snapshot
++
++    // Quire start - waypoint skip helpers
++    private static final boolean QUIRE_VERIFY = Boolean.getBoolean("quire.waypoints.verify");
++    private static final boolean QUIRE_NO_SKIP = Boolean.getBoolean("quire.waypoints.noSkip");
++    private static final boolean QUIRE_STATS = Boolean.getBoolean("quire.waypoints.stats");
++    private static long QUIRE_SKIPPED, QUIRE_FULL, QUIRE_FLUSHES, QUIRE_CLEAN_FLUSHES, QUIRE_LAST_LOG;
++
++    private void quire$verifySkip(final ServerPlayer source) {
++        final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.get(source);
++        if (column == null) {
++            return;
++        }
++        for (final Map.Entry<ServerPlayer, WaypointTransmitter.Connection> entry : column.entrySet()) {
++            if (!(entry.getValue() instanceof WaypointTransmitter.EntityBlockConnection block) || block.distanceManhattan() != 0
++                || WaypointTransmitter.doesSourceIgnoreReceiver(source, entry.getKey())) {
++                throw new IllegalStateException("Quire waypoint skip invariant broken for " + source.getScoreboardName() + " -> " + entry.getKey().getScoreboardName() + ": " + entry.getValue());
++            }
++        }
++    }
++
++    private void quire$createMissing(final WaypointTransmitter waypoint) {
++        final Map<ServerPlayer, WaypointTransmitter.Connection> after = this.byWaypoint.get(waypoint);
++        final int expected = this.players.size() - (waypoint instanceof ServerPlayer self && this.players.contains(self) ? 1 : 0);
++        if (after == null || after.size() != expected) {
++            for (ServerPlayer player : this.players) {
++                if (this.getConnection(player, waypoint) == null) {
++                    this.createConnection(player, waypoint);
++                }
++            }
++        }
++    }
++    // Quire end - waypoint skip helpers
++
+     /** Non-zero while a flush runs: attribute values read during it are cached per entity (see WaypointTransmitter). */
+     public static int quireFlushEpoch;
+     private static int quireNextEpoch;
+@@ -90,6 +291,13 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         }
+         quireNextEpoch = quireNextEpoch == Integer.MAX_VALUE ? 1 : quireNextEpoch + 1;
+         quireFlushEpoch = quireNextEpoch;
++        this.quire$takeSnapshot(); // Quire - flush snapshot
++        QUIRE_FLUSHES++;
++        if (this.quireAllClean) QUIRE_CLEAN_FLUSHES++;
++        if (QUIRE_STATS && System.nanoTime() - QUIRE_LAST_LOG > 30_000_000_000L) {
++            QUIRE_LAST_LOG = System.nanoTime();
++            com.mojang.logging.LogUtils.getLogger().info("[Quire] waypoint flushes={} clean={} sources skipped={} full={}", QUIRE_FLUSHES, QUIRE_CLEAN_FLUSHES, QUIRE_SKIPPED, QUIRE_FULL);
++        }
+         try {
+             java.util.Set<WaypointTransmitter> updatedWaypoints = java.util.Collections.emptySet();
+             if (!this.quireDirtyWaypoints.isEmpty()) {
+@@ -99,8 +307,24 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+                 for (final WaypointTransmitter waypoint : dirty) {
+                     if (this.waypoints.contains(waypoint)) {
+                         updatedWaypoints.add(waypoint);
++                        // Quire start - waypoint skip: a source whose block did not change since its last full
++                        // evaluation, with only block connections, in a clean flush: no connection of it can change
++                        if (this.quireAllClean && waypoint instanceof ServerPlayer source && source.quireWpNonBlockOut == 0
++                            && source.quireWpLastBlock != null && source.quireWpLastBlock.equals(source.blockPosition())) {
++                            if (QUIRE_VERIFY) {
++                                this.quire$verifySkip(source);
++                            }
++                            this.quire$createMissing(waypoint);
++                            QUIRE_SKIPPED++;
++                            continue;
++                        }
++                        // Quire end
+                     }
++                    QUIRE_FULL++;
+                     this.updateWaypoint(waypoint); // no-op unless still tracked
++                    if (waypoint instanceof ServerPlayer source && this.waypoints.contains(waypoint)) {
++                        source.quireWpLastBlock = source.blockPosition(); // Quire - every connection now has this position
++                    }
+                 }
+             }
+             if (!this.quireDirtyPlayers.isEmpty()) {
+@@ -115,6 +339,8 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+             }
+         } finally {
+             quireFlushEpoch = 0;
++            this.quireSnapshotValid = false; // Quire - flush snapshot
++            this.quireAllClean = false; // Quire - waypoint skip
+         }
+     }
+     // Quire end - coalesce position-driven updates to once per tick
+@@ -169,6 +395,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.remove(waypoint);
+         if (column != null) {
+             for (final Map.Entry<ServerPlayer, WaypointTransmitter.Connection> entry : column.entrySet()) {
++                quire$count(entry.getKey(), waypoint, entry.getValue(), -1); // Quire - waypoint skip bookkeeping
+                 entry.getValue().disconnect();
+                 final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(entry.getKey());
+                 if (row != null) {
+@@ -185,6 +412,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+ 
+     public void addPlayer(final ServerPlayer player) {
+         this.players.add(player);
++        this.quire$assignSlot(player); // Quire - flush snapshot
+ 
+         if (this.locatorBarEnabled) { // Paper - optimize ServerWaypointManager with locator bar disabled
+         for (WaypointTransmitter waypoint : this.waypoints) {
+@@ -205,7 +433,9 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         // Quire start - snapshot into arrays instead of ImmutableSet.copyOf; same iteration order
+         final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(player);
+-        if (row != null) {
++        // Quire - waypoint skip: in a clean flush a block connection only changes when its source changed block,
++        // and sources that moved were evaluated in the waypoint pass (alreadyUpdated); nothing else to do
++        if (row != null && !(this.quireAllClean && player.quireWpNonBlockIn == 0)) {
+             final int size = row.size();
+             final WaypointTransmitter[] waypoints = new WaypointTransmitter[size];
+             final WaypointTransmitter.Connection[] connections = new WaypointTransmitter.Connection[size];
+@@ -238,6 +468,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.remove(player);
+         if (row != null) {
+             for (final Map.Entry<WaypointTransmitter, WaypointTransmitter.Connection> entry : row.entrySet()) {
++                quire$count(player, entry.getKey(), entry.getValue(), -1); // Quire - waypoint skip bookkeeping
+                 entry.getValue().disconnect();
+                 final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.get(entry.getKey());
+                 if (column != null) {
+@@ -251,15 +482,17 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         // Quire end - connection index
+         this.untrackWaypoint(player);
+         this.players.remove(player);
++        this.quire$releaseSlot(player); // Quire - flush snapshot
+         this.quireDirtyPlayers.remove(player); // Quire - coalesced updates
+         this.quireDirtyWaypoints.remove(player); // Quire - coalesced updates
+     }
+ 
+     public void breakAllConnections() {
+         // Quire start - connection index
+-        for (final Map<WaypointTransmitter, WaypointTransmitter.Connection> row : this.byPlayer.values()) {
+-            for (final WaypointTransmitter.Connection connection : row.values()) {
+-                connection.disconnect();
++        for (final Map.Entry<ServerPlayer, Map<WaypointTransmitter, WaypointTransmitter.Connection>> rowEntry : this.byPlayer.entrySet()) {
++            for (final Map.Entry<WaypointTransmitter, WaypointTransmitter.Connection> entry : rowEntry.getValue().entrySet()) {
++                quire$count(rowEntry.getKey(), entry.getKey(), entry.getValue(), -1); // Quire - waypoint skip bookkeeping
++                entry.getValue().disconnect();
+             }
+         }
+         this.byPlayer.clear();
+@@ -304,7 +537,8 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     private void updateConnection(final ServerPlayer player, final WaypointTransmitter waypoint, final WaypointTransmitter.Connection connection) {
+         if (player != waypoint) {
+             if (isLocatorBarEnabledFor(player)) {
+-                if (!connection.isBroken()) {
++                final int fast = this.quire$fastIsBroken(player, waypoint, connection); // Quire - flush snapshot
++                if (fast >= 0 ? fast == 0 : !connection.isBroken()) { // Quire - flush snapshot
+                     connection.update();
+                 } else {
+                     waypoint.makeWaypointConnectionWith(player).ifPresentOrElse(newConnection -> {
+diff --git a/net/minecraft/world/waypoints/WaypointTransmitter.java b/net/minecraft/world/waypoints/WaypointTransmitter.java
+index e68337696fe3baac6fe0bb4401ae8e66a890d591..59615d31186e3b1cefe317e659e1b2d0a0662cf9 100644
+--- a/net/minecraft/world/waypoints/WaypointTransmitter.java
++++ b/net/minecraft/world/waypoints/WaypointTransmitter.java
+@@ -142,6 +142,7 @@ public interface WaypointTransmitter extends Waypoint {
+     }
+ 
+     class EntityBlockConnection implements WaypointTransmitter.BlockConnection {
++        public int quireReceiverSlot = -1; // Quire - waypoint flush snapshot slot of the receiver
+         private final LivingEntity source;
+         private final Waypoint.Icon icon;
+         private final ServerPlayer receiver;
+@@ -185,6 +186,7 @@ public interface WaypointTransmitter extends Waypoint {
+     }
+ 
+     class EntityChunkConnection implements WaypointTransmitter.ChunkConnection {
++        public int quireReceiverSlot = -1; // Quire - waypoint flush snapshot slot of the receiver
+         private final LivingEntity source;
+         private final Waypoint.Icon icon;
+         private final ServerPlayer receiver;
+@@ -227,5 +229,10 @@ public interface WaypointTransmitter extends Waypoint {
+                 || WaypointTransmitter.doesSourceIgnoreReceiver(this.source, this.receiver)
+                 || WaypointTransmitter.isChunkVisible(this.lastPosition, this.receiver);
+         }
++
++        // Quire - isBroken() with doesSourceIgnoreReceiver already evaluated
++        public boolean quire$isBroken(final boolean ignored) {
++            return WaypointTransmitter.ChunkConnection.super.isBroken() || ignored || WaypointTransmitter.isChunkVisible(this.lastPosition, this.receiver);
++        }
+     }
+ }

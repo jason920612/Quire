@@ -31,6 +31,7 @@ public final class SectionCompression {
     public static final java.util.concurrent.atomic.LongAdder COMPRESSED = new java.util.concurrent.atomic.LongAdder();
     public static final java.util.concurrent.atomic.LongAdder INFLATED = new java.util.concurrent.atomic.LongAdder();
     public static final java.util.concurrent.atomic.LongAdder FAILED = new java.util.concurrent.atomic.LongAdder();
+    public static final java.util.concurrent.atomic.LongAdder PROMOTED = new java.util.concurrent.atomic.LongAdder();
     public static final java.util.concurrent.atomic.LongAdder PACKED_BYTES = new java.util.concurrent.atomic.LongAdder();
 
     private SectionCompression() {

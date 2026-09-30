@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 15:08:22 +0800
+Subject: [PATCH] Entity tracker snapshot of per-player inputs and per-chunk
+ sent cache
+
+
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 170e65213cceee46a06ac10752589d0c1d4ecdbd..c36827c24c84abcd6deb423910a3a80d1dbef814 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1093,8 +1093,109 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         this.iteratingTrackerEntities = false;
+     }
+ 
++    // Quire start - tracker snapshot
++    // Every tracked entity re-checks every nearby player each tick. Per pair that chased the player, its chunk loader,
++    // a probe of its sent-chunk set and more: memory latency dominated. Per tick the per-player inputs are copied
++    // into flat arrays (slot = index in level.players()), and "chunk sent to player" is cached per chunk, so entities
++    // in the same chunk share it. Any change of tracking state still goes through updatePlayer/removePlayer.
++    // Disabled when plugins listen to track/untrack events (a listener could hide entities or move players mid-loop).
++    final class QuireTrackerSnapshot {
++        ServerPlayer[] players = new ServerPlayer[64];
++        double[] x = new double[64], y = new double[64], z = new double[64];
++        int[] viewBlocks = new int[64];
++        boolean[] noOverrides = new boolean[64];
++        ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData[] loaders = new ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData[64];
++        net.minecraft.server.network.ServerGamePacketListenerImpl[] connections = new net.minecraft.server.network.ServerGamePacketListenerImpl[64];
++        int count;
++        final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<long[]> chunkSent = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
++        int words;
++
++        void take(final List<ServerPlayer> players) {
++            final int n = players.size();
++            if (n > this.players.length) {
++                final int cap = Math.max(n, this.players.length * 2);
++                this.players = new ServerPlayer[cap];
++                this.x = new double[cap];
++                this.y = new double[cap];
++                this.z = new double[cap];
++                this.viewBlocks = new int[cap];
++                this.noOverrides = new boolean[cap];
++                this.loaders = new ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData[cap];
++                this.connections = new net.minecraft.server.network.ServerGamePacketListenerImpl[cap];
++            }
++            for (int i = 0; i < n; ++i) {
++                final ServerPlayer player = players.get(i);
++                player.quireTrackSlot = i;
++                this.players[i] = player;
++                this.x[i] = player.getX();
++                this.y[i] = player.getY();
++                this.z[i] = player.getZ();
++                this.viewBlocks[i] = ChunkMap.this.getPlayerViewDistance(player) * 16;
++                this.noOverrides[i] = player.getBukkitEntity().quire$hasNoVisibilityOverrides();
++                this.loaders[i] = ((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer)player).moonrise$getChunkLoader();
++                this.connections[i] = player.connection;
++            }
++            for (int i = n; i < this.count; ++i) {
++                this.players[i] = null;
++                this.loaders[i] = null;
++                this.connections[i] = null;
++            }
++            this.count = n;
++            this.words = (n + 63) >>> 6;
++            this.chunkSent.clear();
++        }
++
++        /** Per-chunk bitsets: [0, words) known, [words, 2 * words) sent. */
++        long[] chunkBits(final long chunkKey) {
++            long[] bits = this.chunkSent.get(chunkKey);
++            if (bits == null) {
++                bits = new long[this.words * 2];
++                this.chunkSent.put(chunkKey, bits);
++            }
++            return bits;
++        }
++
++        boolean isChunkSent(final long[] bits, final int slot, final long chunkKey) {
++            final int word = slot >>> 6;
++            final long mask = 1L << slot;
++            if ((bits[word] & mask) != 0L) {
++                return (bits[this.words + word] & mask) != 0L;
++            }
++            final ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData loader = this.loaders[slot];
++            final boolean sent = loader != null && loader.getSentChunksRaw().contains(chunkKey);
++            bits[word] |= mask;
++            if (sent) {
++                bits[this.words + word] |= mask;
++            }
++            return sent;
++        }
++
++        void clear() {
++            for (int i = 0; i < this.count; ++i) {
++                this.players[i].quireTrackSlot = -1;
++                this.players[i] = null;
++                this.loaders[i] = null;
++                this.connections[i] = null;
++            }
++            this.count = 0;
++            this.chunkSent.clear();
++        }
++    }
++
++    private final QuireTrackerSnapshot quireTrackerSnapshot = new QuireTrackerSnapshot();
++    private static final boolean QUIRE_NO_TRACKER_SNAPSHOT = Boolean.getBoolean("quire.tracker.noSnapshot");
++    private @Nullable QuireTrackerSnapshot quireActiveSnapshot;
++    // Quire end - tracker snapshot
++
+     private void newTrackerTick() {
+         this.iteratingTrackerEntities = true;
++        // Quire start - tracker snapshot
++        if (!QUIRE_NO_TRACKER_SNAPSHOT && io.papermc.paper.event.player.PlayerTrackEntityEvent.getHandlerList().getRegisteredListeners().length == 0
++            && io.papermc.paper.event.player.PlayerUntrackEntityEvent.getHandlerList().getRegisteredListeners().length == 0) {
++            this.quireTrackerSnapshot.take(this.level.players());
++            this.quireActiveSnapshot = this.quireTrackerSnapshot;
++        }
++        // Quire end - tracker snapshot
+         try {
+             final ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.world.entity.Entity> trackerEntities = this.trackerEntities;
+             final Entity[] trackerEntitiesRaw = trackerEntities.getRawDataUnchecked();
+@@ -1112,6 +1213,12 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             }
+         } finally {
+             this.iteratingTrackerEntities = false;
++            // Quire start - tracker snapshot
++            if (this.quireActiveSnapshot != null) {
++                this.quireActiveSnapshot = null;
++                this.quireTrackerSnapshot.clear();
++            }
++            // Quire end - tracker snapshot
+         }
+     }
+     // Paper end - optimise entity tracker
+@@ -1291,6 +1398,12 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+             final ServerPlayer[] playersRaw = players.getRawDataUnchecked();
+ 
++            // Quire start - tracker snapshot
++            final QuireTrackerSnapshot snapshot = ChunkMap.this.quireActiveSnapshot;
++            if (snapshot != null) {
++                this.quire$updatePlayersFast(snapshot, playersRaw, players.size());
++            } else
++            // Quire end - tracker snapshot
+             for (int i = 0, len = players.size(); i < len; ++i) {
+                 final ServerPlayer player = playersRaw[i];
+                 this.updatePlayer(player);
+@@ -1405,6 +1518,55 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             }
+         }
+ 
++        // Quire start - tracker snapshot: same decision as updatePlayer, evaluated from the snapshot; any change of
++        // tracking state (start or stop tracking) is delegated to updatePlayer, which re-evaluates from live state
++        private void quire$updatePlayersFast(final QuireTrackerSnapshot snapshot, final ServerPlayer[] playersRaw, final int len) {
++            final Entity entity = this.entity;
++            final double ex = entity.getX();
++            final double ey = entity.getY();
++            final double ez = entity.getZ();
++            final int effectiveRange = this.getEffectiveRange();
++            final double rangeY = ChunkMap.this.level.paperConfig().entities.trackingRangeY.enabled
++                ? ChunkMap.this.level.paperConfig().entities.trackingRangeY.get(entity, -1) : -1;
++            final int chunkX = entity.chunkPosition().x();
++            final int chunkZ = entity.chunkPosition().z();
++            final long chunkKey = ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkX, chunkZ);
++            long[] chunkBits = null;
++            for (int i = 0; i < len; ++i) {
++                final ServerPlayer player = playersRaw[i];
++                if (player == entity) {
++                    continue;
++                }
++                final int s = player.quireTrackSlot;
++                if (s < 0 || s >= snapshot.count || snapshot.players[s] != player) {
++                    this.updatePlayer(player);
++                    continue;
++                }
++                final double dx = snapshot.x[s] - ex;
++                final double dz = snapshot.z[s] - ez;
++                final double visibleRange = Math.min(effectiveRange, snapshot.viewBlocks[s]);
++                boolean visible = dx * dx + dz * dz <= visibleRange * visibleRange;
++                if (visible && rangeY != -1) {
++                    final double dy = snapshot.y[s] - ey;
++                    visible = dy * dy <= rangeY * rangeY;
++                }
++                if (visible) {
++                    if (chunkBits == null) {
++                        chunkBits = snapshot.chunkBits(chunkKey);
++                    }
++                    visible = entity.broadcastToPlayer(player) && snapshot.isChunkSent(chunkBits, s, chunkKey);
++                }
++                if (visible) {
++                    visible = snapshot.noOverrides[s] ? entity.visibleByDefault : player.getBukkitEntity().quire$canSee(entity);
++                }
++                final boolean seen = this.seenBy.contains(snapshot.connections[s]);
++                if (visible != seen) {
++                    this.updatePlayer(player);
++                }
++            }
++        }
++        // Quire end - tracker snapshot
++
+         public void updatePlayer(final ServerPlayer player) {
+             org.spigotmc.AsyncCatcher.catchOp("player tracker update"); // Spigot
+             if (player != this.entity) {

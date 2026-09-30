@@ -9,6 +9,7 @@ import net.minecraft.util.SimpleBitStorage;
 public final class SparseBitStorage extends FrozenBitStorage {
 
     private final Sparse4096 sparse;
+    private static final ThreadLocal<int[]> DECODE_BUFFER = ThreadLocal.withInitial(() -> new int[4096]);
 
     private SparseBitStorage(final Owner owner, final int bits, final int rawLength, final Sparse4096 sparse) {
         super(owner, bits, 4096, rawLength);
@@ -38,9 +39,16 @@ public final class SparseBitStorage extends FrozenBitStorage {
         final int bits = this.bits;
         final int valuesPerLong = 64 / bits;
         final long[] raw = new long[this.rawLength];
-        for (int i = 0; i < 4096; i++) {
-            final int cellIndex = i / valuesPerLong;
-            raw[cellIndex] |= (long) this.sparse.get(i) << ((i - cellIndex * valuesPerLong) * bits);
+        final int[] values = DECODE_BUFFER.get();
+        this.sparse.decodeAll(values);
+        int i = 0;
+        for (int cellIndex = 0; cellIndex < raw.length; cellIndex++) {
+            long word = 0L;
+            final int end = Math.min(4096, i + valuesPerLong);
+            for (int shift = 0; i < end; i++, shift += bits) {
+                word |= (long) values[i] << shift;
+            }
+            raw[cellIndex] = word;
         }
         return raw;
     }

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 15:08:22 +0800
+Subject: [PATCH] Exact nearest-player queries through per-chunk nearby player
+ lists
+
+
+diff --git a/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java b/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
+index fff7a796a61542213bdaa417d44e25cd05f7e774..1f24074a425f10e8f2e411c881f1085ea1e98b8d 100644
+--- a/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
++++ b/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
+@@ -72,6 +72,10 @@ public final class NearbyPlayers {
+         this.world = world;
+     }
+ 
++    public int quire$playerCount() { // Quire
++        return this.players.size();
++    }
++
+     public void addPlayer(final ServerPlayer player) {
+         final TrackedPlayer[] newTrackers = new TrackedPlayer[TOTAL_MAP_TYPES];
+         if (this.players.putIfAbsent(player, newTrackers) != null) {
+diff --git a/net/minecraft/server/level/ServerEntityGetter.java b/net/minecraft/server/level/ServerEntityGetter.java
+index cc6f4e2845ef1e95c765d65f17c8aa1b06652927..1e42e45c8635c8d802b9c33100c68ca259be3c6a 100644
+--- a/net/minecraft/server/level/ServerEntityGetter.java
++++ b/net/minecraft/server/level/ServerEntityGetter.java
+@@ -16,12 +16,28 @@ public interface ServerEntityGetter extends EntityGetter {
+     ServerLevel getLevel();
+ 
+     default @Nullable Player getNearestPlayer(final TargetingConditions targetConditions, final LivingEntity source) {
++        // Quire start - spatial nearest-player query (exact; falls back to the scan)
++        if (this instanceof ServerLevel serverLevel) {
++            final Object quireResult = dev.quire.util.NearestPlayers.nearestTargetable(serverLevel, targetConditions, source, source.getX(), source.getY(), source.getZ());
++            if (quireResult != dev.quire.util.NearestPlayers.NOT_HANDLED) {
++                return (Player)quireResult;
++            }
++        }
++        // Quire end
+         return this.getNearestEntity(this.players(), targetConditions, source, source.getX(), source.getY(), source.getZ());
+     }
+ 
+     default @Nullable Player getNearestPlayer(
+         final TargetingConditions targetConditions, final LivingEntity source, final double x, final double y, final double z
+     ) {
++        // Quire start - spatial nearest-player query (exact; falls back to the scan)
++        if (this instanceof ServerLevel serverLevel && source != null) {
++            final Object quireResult = dev.quire.util.NearestPlayers.nearestTargetable(serverLevel, targetConditions, source, x, y, z);
++            if (quireResult != dev.quire.util.NearestPlayers.NOT_HANDLED) {
++                return (Player)quireResult;
++            }
++        }
++        // Quire end
+         return this.getNearestEntity(this.players(), targetConditions, source, x, y, z);
+     }
+ 
+diff --git a/net/minecraft/world/entity/ai/targeting/TargetingConditions.java b/net/minecraft/world/entity/ai/targeting/TargetingConditions.java
+index bd6d9fdeb468428bdf35e888be141293088228a4..f88b987536b93508a1eb11dba8a6eb3f654f4390 100644
+--- a/net/minecraft/world/entity/ai/targeting/TargetingConditions.java
++++ b/net/minecraft/world/entity/ai/targeting/TargetingConditions.java
+@@ -56,6 +56,16 @@ public class TargetingConditions {
+         return this;
+     }
+ 
++    // Quire start - upper bound of distance(targeter, target) for any target that passes test(), or -1 if unbounded
++    public double quire$maxPassingDistance(final @Nullable LivingEntity targeter) {
++        if (targeter == null || !(this.range > 0.0)) {
++            return -1.0;
++        }
++        // getVisibilityPercent is clamped to [0, 10]
++        return Math.max(this.range * (this.testInvisible ? 10.0 : 1.0), 2.0);
++    }
++    // Quire end
++
+     public boolean test(final ServerLevel level, final @Nullable LivingEntity targeter, final LivingEntity target) {
+         if (targeter == target) {
+             return false;
+diff --git a/net/minecraft/world/level/EntityGetter.java b/net/minecraft/world/level/EntityGetter.java
+index cc938f43c4a5e947ed87ca2001cbaca4084bf64c..e5f2d4c9564264a82730f896573bf0cea71d06d7 100644
+--- a/net/minecraft/world/level/EntityGetter.java
++++ b/net/minecraft/world/level/EntityGetter.java
+@@ -119,6 +119,14 @@ public interface EntityGetter extends ca.spottedleaf.moonrise.patches.chunk_syst
+     // Paper end - Affects Spawning API
+ 
+     default @Nullable Player getNearestPlayer(final double x, final double y, final double z, final double range, final @Nullable Predicate<Entity> predicate) {
++        // Quire start - spatial nearest-player query (exact; falls back to the scan below)
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel) {
++            final Object quireResult = dev.quire.util.NearestPlayers.nearest(serverLevel, x, y, z, range, predicate);
++            if (quireResult != dev.quire.util.NearestPlayers.NOT_HANDLED) {
++                return (Player)quireResult;
++            }
++        }
++        // Quire end
+         double best = -1.0;
+         Player result = null;
+ 
