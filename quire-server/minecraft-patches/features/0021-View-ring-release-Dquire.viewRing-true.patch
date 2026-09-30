@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 16:07:47 +0800
+Subject: [PATCH] View ring release (-Dquire.viewRing=true)
+
+Chunks farther than max(simulation distance + 2, 7) are loaded only to be
+sent and released once their neighbours are sent; the client keeps them.
+Players that hold a released chunk are remembered so a re-created chunk
+holder broadcasts later changes to them. Entities beyond 7 chunks are
+already outside the default entity tracking ranges.
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index 45c927417d34ddd48c92116efd9b5777bfc52e35..65c88f21c27082727405fd0ef414737006261b80 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -303,6 +303,16 @@ public final class RegionizedPlayerChunkLoader {
+         return false;
+     }
+ 
++    // Quire start - view ring release
++    // Chunks beyond the resident radius are loaded only to be sent, then released while the client keeps them.
++    // Players that hold a released chunk are remembered here so a re-created chunk holder broadcasts to them.
++    public final java.util.concurrent.ConcurrentHashMap<Long, java.util.Set<ServerPlayer>> quireReleasedReceivers = new java.util.concurrent.ConcurrentHashMap<>();
++
++    public java.util.Set<ServerPlayer> quire$releasedReceivers(final long chunkKey) {
++        return this.quireReleasedReceivers.get(chunkKey);
++    }
++    // Quire end - view ring release
++
+     public void tick() {
+         TickThread.ensureTickThread("Cannot tick player chunk loader async");
+         long currTime = System.nanoTime();
+@@ -344,6 +354,72 @@ public final class RegionizedPlayerChunkLoader {
+         private boolean canGenerateChunks = true;
+ 
+         private final ArrayDeque<ChunkHolderManager.TicketOperation<?, ?>> delayedTicketOps = new ArrayDeque<>();
++        // Quire start - view ring release
++        private static final boolean QUIRE_VIEW_RING = Boolean.getBoolean("quire.viewRing");
++        // entities farther than the entity tracking range (default at most 96 blocks = 6 chunks for non-players) are
++        // never shown to clients, so keeping at least 7 chunks resident loses nothing visible
++        private static final int QUIRE_MIN_RESIDENT = Integer.getInteger("quire.viewRing.minResident", 7);
++        private int quireResident = Integer.MAX_VALUE;
++        private final LongOpenHashSet quireReleaseCandidates = new LongOpenHashSet();
++
++        private boolean quire$neighbourNeedsSend(final int chunkX, final int chunkZ) {
++            for (int dz = -1; dz <= 1; ++dz) {
++                for (int dx = -1; dx <= 1; ++dx) {
++                    if ((dx | dz) == 0) {
++                        continue;
++                    }
++                    final int nx = chunkX + dx, nz = chunkZ + dz;
++                    if (this.wantChunkSent(nx, nz) && !this.sentChunks.contains(CoordinateUtils.getChunkKey(nx, nz))) {
++                        return true;
++                    }
++                }
++            }
++            return false;
++        }
++
++        /** Whether a chunk beyond the resident radius must be (kept) loaded: to be sent, or as neighbour of a pending send. */
++        private boolean quire$ringNeeded(final int chunkX, final int chunkZ) {
++            final long key = CoordinateUtils.getChunkKey(chunkX, chunkZ);
++            return (this.wantChunkSent(chunkX, chunkZ) && !this.sentChunks.contains(key)) || this.quire$neighbourNeedsSend(chunkX, chunkZ);
++        }
++
++        private boolean quire$beyondResident(final int chunkX, final int chunkZ) {
++            return Math.max(Math.abs(this.lastChunkX - chunkX), Math.abs(this.lastChunkZ - chunkZ)) > this.quireResident;
++        }
++
++        private void quire$releaseCandidates() {
++            if (this.quireReleaseCandidates.isEmpty()) {
++                return;
++            }
++            final RegionizedPlayerChunkLoader loader = ((ChunkSystemServerLevel)this.world).moonrise$getPlayerChunkLoader();
++            final it.unimi.dsi.fastutil.longs.LongIterator iterator = this.quireReleaseCandidates.iterator();
++            while (iterator.hasNext()) {
++                final long chunk = iterator.nextLong();
++                final int chunkX = CoordinateUtils.getChunkX(chunk);
++                final int chunkZ = CoordinateUtils.getChunkZ(chunk);
++                final byte stage = this.chunkTicketStage.get(chunk);
++                if (stage != CHUNK_TICKET_STAGE_GENERATED || !this.quire$beyondResident(chunkX, chunkZ)) {
++                    if (stage == CHUNK_TICKET_STAGE_NONE || !this.quire$beyondResident(chunkX, chunkZ)) {
++                        iterator.remove();
++                    }
++                    continue; // only release chunks that are in no queue
++                }
++                if (this.quire$ringNeeded(chunkX, chunkZ)) {
++                    continue;
++                }
++                iterator.remove();
++                this.chunkTicketStage.remove(chunk);
++                if (this.sentChunks.contains(chunk)) {
++                    loader.quireReleasedReceivers.computeIfAbsent(chunk, k -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(this.player);
++                }
++                this.pushDelayedTicketOp(ChunkHolderManager.TicketOperation.addAndRemove(
++                    chunk,
++                    PLAYER_TICKET_DELAYED, GENERATED_TICKET_LEVEL, this.idBoxed,
++                    PLAYER_TICKET, GENERATED_TICKET_LEVEL, this.idBoxed
++                ));
++            }
++        }
++        // Quire end - view ring release
+         private final LongOpenHashSet sentChunks = new LongOpenHashSet();
+ 
+         private static final byte CHUNK_TICKET_STAGE_NONE           = 0;
+@@ -440,6 +516,9 @@ public final class RegionizedPlayerChunkLoader {
+ 
+                 PlatformHooks.get().onChunkWatch(this.world, chunk, this.player);
+                 PlayerChunkSender.sendChunk(this.player.connection, this.world, chunk);
++                if (this.quire$beyondResident(chunkX, chunkZ)) { // Quire - view ring release
++                    this.quireReleaseCandidates.add(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++                }
+                 return;
+             }
+             throw new IllegalStateException();
+@@ -456,8 +535,17 @@ public final class RegionizedPlayerChunkLoader {
+             PlatformHooks.get().onChunkUnWatch(this.world, new ChunkPos(chunkX, chunkZ), this.player);
+             // Note: Check PlayerChunkSender#dropChunk for other logic
+             // Note: drop isAlive() check so that chunks properly unload client-side when the player dies
+-            ((ChunkSystemChunkHolder)((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().chunkHolderManager
+-                .getChunkHolder(chunkX, chunkZ).vanillaChunkHolder).moonrise$removeReceivedChunk(this.player);
++            // Quire start - view ring release: a released chunk may have no holder; forget the released record
++            final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder quireHolder = ((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().chunkHolderManager
++                .getChunkHolder(chunkX, chunkZ);
++            final java.util.Set<ServerPlayer> quireReleased = ((ChunkSystemServerLevel)this.world).moonrise$getPlayerChunkLoader().quireReleasedReceivers.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++            final boolean quireWasReleased = quireReleased != null && quireReleased.remove(this.player);
++            if (quireReleased != null && quireReleased.isEmpty()) {
++                ((ChunkSystemServerLevel)this.world).moonrise$getPlayerChunkLoader().quireReleasedReceivers.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ), quireReleased);
++            }
++            if (quireHolder != null && (!quireWasReleased || ((ChunkSystemChunkHolder)quireHolder.vanillaChunkHolder).moonrise$hasChunkBeenSent(this.player)))
++            // Quire end - view ring release
++            ((ChunkSystemChunkHolder)quireHolder.vanillaChunkHolder).moonrise$removeReceivedChunk(this.player);
+             this.player.connection.send(new ClientboundForgetLevelChunkPacket(new ChunkPos(chunkX, chunkZ)));
+             // Paper start - PlayerChunkUnloadEvent
+             if (io.papermc.paper.event.packet.PlayerChunkUnloadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+@@ -763,7 +851,7 @@ public final class RegionizedPlayerChunkLoader {
+                 }
+ 
+                 // try to move to send queue
+-                if (this.wantChunkSent(pendingChunkX, pendingChunkZ)) {
++                if (this.wantChunkSent(pendingChunkX, pendingChunkZ) && !this.sentChunks.contains(pendingGenChunk)) { // Quire - view ring release: a released chunk may be reloaded after it was sent
+                     this.sendQueue.enqueue(pendingGenChunk);
+                 }
+                 // try to move to tick queue
+@@ -866,6 +954,7 @@ public final class RegionizedPlayerChunkLoader {
+                 }
+             }
+ 
++            this.quire$releaseCandidates(); // Quire - view ring release
+             this.flushDelayedTicketOps();
+         }
+ 
+@@ -991,6 +1080,7 @@ public final class RegionizedPlayerChunkLoader {
+             this.lastLoadDistance = loadViewDistance;
+             this.lastTickDistance = tickViewDistance;
+             this.canGenerateChunks = canGenerateChunks;
++            this.quireResident = QUIRE_VIEW_RING ? Math.max(tickViewDistance + 2, QUIRE_MIN_RESIDENT) : Integer.MAX_VALUE; // Quire - view ring release
+ 
+             // +1 since we need to load chunks +1 around the load view distance...
+             final long[] toIterate = ParallelSearchRadiusIteration.getEuclideanIteration(loadViewDistance + 1);
+@@ -1020,6 +1110,16 @@ public final class RegionizedPlayerChunkLoader {
+                 }
+ 
+                 final byte stage = this.chunkTicketStage.get(chunk);
++                // Quire start - view ring release: beyond the resident radius only load what still has to be sent
++                if (squareDistance > this.quireResident && !this.quire$ringNeeded(chunkX, chunkZ)) {
++                    if (stage != CHUNK_TICKET_STAGE_NONE) {
++                        this.quireReleaseCandidates.add(chunk);
++                    }
++                    if (stage == CHUNK_TICKET_STAGE_NONE || stage == CHUNK_TICKET_STAGE_GENERATED) {
++                        continue;
++                    }
++                }
++                // Quire end - view ring release
+                 switch (stage) {
+                     case CHUNK_TICKET_STAGE_NONE: {
+                         // we want the chunk to be at least loaded
+diff --git a/net/minecraft/server/level/ChunkHolder.java b/net/minecraft/server/level/ChunkHolder.java
+index cd5a325d37f617431ceb568a655701601618198f..9f881ada3fcc748b7f04f4348997c0ae3b8a5683 100644
+--- a/net/minecraft/server/level/ChunkHolder.java
++++ b/net/minecraft/server/level/ChunkHolder.java
+@@ -152,6 +152,16 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+         // Paper - rewrite chunk system
+         this.setTicketLevel(ticketLevel);
+         this.changedBlocksPerSection = new ShortSet[levelHeightAccessor.getSectionsCount()];
++        // Quire start - view ring release: players that still hold this chunk from before it was released
++        final ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader quireLoader = playerProvider instanceof ChunkMap chunkMap
++            ? ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)chunkMap.level).moonrise$getPlayerChunkLoader() : null;
++        final java.util.Set<ServerPlayer> quireReceivers = quireLoader == null ? null : quireLoader.quire$releasedReceivers(pos.longKey());
++        if (quireReceivers != null) {
++            for (final ServerPlayer player : quireReceivers) {
++                this.playersSentChunkTo.add(player);
++            }
++        }
++        // Quire end - view ring release
+     }
+ 
+     // CraftBukkit start
