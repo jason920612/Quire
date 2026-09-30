@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 1 Oct 2026 03:56:56 +0800
+Subject: [PATCH] Cached wire POWER per state, world border without a map
+ lookup, debug subscriber fast path
+
+
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 39d5f4bcd0aa587c892866a33d3270145a9b824b..72046d8cbbd48100107d2c69432b5f57c5757884 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -2583,9 +2583,22 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             );
+     }
+ 
++    // Quire start - the border object, revalidated by the storage's generation instead of a map lookup per call
++    private @Nullable WorldBorder quireWorldBorder;
++    private int quireWorldBorderGeneration;
++    // Quire end
++
+     @Override
+     public WorldBorder getWorldBorder() {
+-        WorldBorder worldBorder = this.getDataStorage().computeIfAbsent(WorldBorder.TYPE);
++        // Quire start
++        final net.minecraft.world.level.storage.SavedDataStorage storage = this.getDataStorage();
++        WorldBorder worldBorder = this.quireWorldBorder;
++        if (worldBorder == null || this.quireWorldBorderGeneration != storage.quireGeneration) {
++            worldBorder = storage.computeIfAbsent(WorldBorder.TYPE);
++            this.quireWorldBorder = worldBorder;
++            this.quireWorldBorderGeneration = storage.quireGeneration;
++        }
++        // Quire end
+         worldBorder.applyInitialSettings(this.levelData.getGameTime());
+         return worldBorder;
+     }
+diff --git a/net/minecraft/util/debug/ServerDebugSubscribers.java b/net/minecraft/util/debug/ServerDebugSubscribers.java
+index ffbc6e6b88336e692c94586de8181a8c33b002f3..7b85d1ed6b07e384a7803551a0656c33d67d6441 100644
+--- a/net/minecraft/util/debug/ServerDebugSubscribers.java
++++ b/net/minecraft/util/debug/ServerDebugSubscribers.java
+@@ -20,7 +20,7 @@ public class ServerDebugSubscribers {
+     }
+ 
+     private List<ServerPlayer> getSubscribersFor(final DebugSubscription<?> subscription) {
+-        return this.enabledSubscriptions.getOrDefault(subscription, List.of());
++        return this.enabledSubscriptions.isEmpty() ? List.of() : this.enabledSubscriptions.getOrDefault(subscription, List.of()); // Quire - no hashing when nobody subscribes
+     }
+ 
+     public void tick() {
+diff --git a/net/minecraft/world/level/block/RedstoneWireBlock.java b/net/minecraft/world/level/block/RedstoneWireBlock.java
+index fda0f900790ead52bf53b3d34c56909fca38dcdd..96c2dea774bea0d68dbb1f5708af7d2fdb090ab1 100644
+--- a/net/minecraft/world/level/block/RedstoneWireBlock.java
++++ b/net/minecraft/world/level/block/RedstoneWireBlock.java
+@@ -446,7 +446,7 @@ public class RedstoneWireBlock extends Block {
+ 
+     @Override
+     protected int ownSignal(final BlockState state, final BlockGetter level, final BlockPos pos) {
+-        return state.getValue(POWER);
++        return state.quire$wirePower(); // Quire - cached POWER
+     }
+ 
+     @Override
+diff --git a/net/minecraft/world/level/block/state/BlockState.java b/net/minecraft/world/level/block/state/BlockState.java
+index 921081dc4f8374bd6eb3a1e6d29fa50f6c420efd..4364816b13a7b0782849cc91549c9f4a3413e0ab 100644
+--- a/net/minecraft/world/level/block/state/BlockState.java
++++ b/net/minecraft/world/level/block/state/BlockState.java
+@@ -7,6 +7,19 @@ import net.minecraft.world.level.block.Block;
+ import net.minecraft.world.level.block.state.properties.Property;
+ 
+ public class BlockState extends BlockBehaviour.BlockStateBase {
++    // Quire start - redstone wire POWER, read on every wire signal query (states are immutable: cache it lazily)
++    private byte quireWirePower = -1;
++
++    /** getValue(RedstoneWireBlock.POWER); only for states that have it. */
++    public final int quire$wirePower() {
++        int power = this.quireWirePower;
++        if (power < 0) {
++            power = this.getValue(net.minecraft.world.level.block.RedstoneWireBlock.POWER);
++            this.quireWirePower = (byte) power;
++        }
++        return power;
++    }
++    // Quire end
+     public static final Codec<BlockState> FULL_CODEC = codec(BuiltInRegistries.BLOCK.byNameCodec(), Block::defaultBlockState, Block::getStateDefinition)
+         .stable();
+     private static final Codec<Either<Block, BlockState>> CONSTANT_OR_DISPATCH_CODEC = Codec.either(BuiltInRegistries.BLOCK.byNameCodec(), FULL_CODEC);
+diff --git a/net/minecraft/world/level/redstone/DefaultRedstoneWireEvaluator.java b/net/minecraft/world/level/redstone/DefaultRedstoneWireEvaluator.java
+index 9027dfa971e3d3b83d4647691e3332f1e851c760..8c74e7a045ec6d705a5a7638a9fb0652ec6d6cc0 100644
+--- a/net/minecraft/world/level/redstone/DefaultRedstoneWireEvaluator.java
++++ b/net/minecraft/world/level/redstone/DefaultRedstoneWireEvaluator.java
+@@ -21,7 +21,7 @@ public class DefaultRedstoneWireEvaluator extends RedstoneWireEvaluator {
+     ) {
+         int targetStrength = this.calculateTargetStrength(level, pos);
+         // Paper start - Call BlockRedstoneEvent
+-        int previousStrength = state.getValue(RedstoneWireBlock.POWER);
++        int previousStrength = state.quire$wirePower(); // Quire - cached POWER
+         if (previousStrength != targetStrength && level.getBlockState(pos) == state) {
+             targetStrength = org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, previousStrength, targetStrength).getNewCurrent();
+         }
+diff --git a/net/minecraft/world/level/redstone/RedstoneWireEvaluator.java b/net/minecraft/world/level/redstone/RedstoneWireEvaluator.java
+index 01a3662cb6539b842e5d62ba150cc0f5990caa04..f2fef7f28555530ca2ef2f59b05b80675f0ac706 100644
+--- a/net/minecraft/world/level/redstone/RedstoneWireEvaluator.java
++++ b/net/minecraft/world/level/redstone/RedstoneWireEvaluator.java
+@@ -23,7 +23,7 @@ public abstract class RedstoneWireEvaluator {
+     }
+ 
+     protected int getWireSignal(final BlockPos pos, final BlockState state) {
+-        return state.is(this.wireBlock) ? state.getValue(RedstoneWireBlock.POWER) : 0;
++        return state.is(this.wireBlock) ? state.quire$wirePower() : 0; // Quire - cached POWER
+     }
+ 
+     protected int getIncomingWireSignal(final Level level, final BlockPos pos) {
+diff --git a/net/minecraft/world/level/storage/SavedDataStorage.java b/net/minecraft/world/level/storage/SavedDataStorage.java
+index f359e53024019f35aaa5cd8477da708bda2fc57a..7a74cb65a5013541737f2f3ac350621e2a0c78fa 100644
+--- a/net/minecraft/world/level/storage/SavedDataStorage.java
++++ b/net/minecraft/world/level/storage/SavedDataStorage.java
+@@ -62,6 +62,8 @@ public class SavedDataStorage implements AutoCloseable {
+         }
+     }
+ 
++    public int quireGeneration; // Quire - bumped whenever a cache entry is (re)placed; holders of looked-up data revalidate
++
+     public <T extends SavedData> T computeIfAbsent(final SavedDataType<T> type) {
+         T data = this.get(type);
+         if (data != null) {
+@@ -78,6 +80,7 @@ public class SavedDataStorage implements AutoCloseable {
+         if (data == null) {
+             data = Optional.ofNullable(this.readSavedData(type));
+             this.cache.put(type, data);
++            this.quireGeneration++; // Quire
+         }
+ 
+         return (T)data.orElse(null);
+@@ -103,6 +106,7 @@ public class SavedDataStorage implements AutoCloseable {
+ 
+     public <T extends SavedData> void set(final SavedDataType<T> type, final T data) {
+         this.cache.put(type, Optional.of(data));
++        this.quireGeneration++; // Quire
+         data.setDirty();
+     }
+ 

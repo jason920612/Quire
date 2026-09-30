@@ -44,10 +44,10 @@ public final class SectionCompactor {
      */
     private static final boolean COLD_DEFLATE = Boolean.getBoolean("quire.compressSections.coldDeflate");
     /**
-     * Sections with randomly ticking blocks in block-ticking chunks stay plain (and encoded ones are inflated back): random
-     * ticks read them every tick, and their writes kept inflating and re-encoding them.
+     * Opt-in: sections with randomly ticking blocks in block-ticking chunks stay plain (and encoded ones are inflated
+     * back). Measured no faster on a one-core hub, while walk50 held ~25 MB more; read heat (below) covers hot sections.
      */
-    private static final boolean TICKING_PLAIN = !Boolean.getBoolean("quire.compressSections.encodeTicking");
+    private static final boolean TICKING_PLAIN = Boolean.getBoolean("quire.compressSections.tickingPlain");
 
     private static FrozenBitStorage encode(final Job job) {
         final long[] raw = job.snapshot() != null ? job.snapshot() : job.frozen().getRaw();
@@ -111,6 +111,7 @@ public final class SectionCompactor {
 
     private static void scan(final MinecraftServer server, final long deadline, final java.util.List<Job> batch) {
         final int now = LightFreezer.clock();
+        final ServerLevel overworld = server.overworld();
         for (final ServerLevel level : server.getAllLevels()) {
             final var loaded = ((ChunkSystemServerLevel) level).moonrise$getLoadedChunks();
             final LevelChunk[] raw = loaded.getRawDataUnchecked();
@@ -138,7 +139,7 @@ public final class SectionCompactor {
                     visited = size; // pass complete: this is its last chunk
                 }
                 cursor[0] = (cursor[0] + 1) % size;
-                if (cursor[0] == 0 && level == server.overworld()) {
+                if (cursor[0] == 0 && level == overworld) {
                     PASSES.increment();
                 }
                 final LevelChunk chunk = raw[cursor[0]];
