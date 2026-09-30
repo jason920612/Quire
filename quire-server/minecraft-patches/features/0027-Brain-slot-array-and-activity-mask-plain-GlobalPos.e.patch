@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 1 Oct 2026 00:36:15 +0800
+Subject: [PATCH] Brain slot array and activity mask, plain GlobalPos.equals,
+ cached fence/wall tags, no-op effect flush, read-heat and ticking-section
+ inflation hooks
+
+
+diff --git a/net/minecraft/core/GlobalPos.java b/net/minecraft/core/GlobalPos.java
+index d09cead678f48f2fa47a55487f3563f9f680d26b..291d029c83a53d981c15817748ee9f85ea78bcdd 100644
+--- a/net/minecraft/core/GlobalPos.java
++++ b/net/minecraft/core/GlobalPos.java
+@@ -23,6 +23,15 @@ public record GlobalPos(ResourceKey<Level> dimension, BlockPos pos) {
+         return new GlobalPos(dimension, pos);
+     }
+ 
++    // Quire start - plain equals (same semantics as the record's: component-wise Objects.equals); the generated one
++    // stayed an un-inlined method handle chain in hot villager job-site comparisons. hashCode is left generated.
++    @Override
++    public boolean equals(final Object obj) {
++        return this == obj || obj instanceof GlobalPos other
++            && java.util.Objects.equals(this.dimension, other.dimension) && java.util.Objects.equals(this.pos, other.pos);
++    }
++    // Quire end
++
+     @Override
+     public String toString() {
+         return this.dimension + " " + this.pos;
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 2b68afed3a08ef045203a78c4f5a16612e70fb6b..5f3bc380fb5ef6f1f9876c08f8260a5034ab0855 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -1578,8 +1578,8 @@ public abstract class Entity
+             }
+ 
+             BlockState belowState = this.level().getBlockState(getOnPos);
+-            return (!(offset <= 0.5) || !belowState.is(BlockTags.FENCES))
+-                    && !belowState.is(BlockTags.WALLS)
++            return (!(offset <= 0.5) || !belowState.getBlock().quire$hasHotTag(net.minecraft.world.level.block.Block.QUIRE_TAG_FENCES)) // Quire - cached tag membership
++                    && !belowState.getBlock().quire$hasHotTag(net.minecraft.world.level.block.Block.QUIRE_TAG_WALLS) // Quire - cached tag membership
+                     && !(belowState.getBlock() instanceof FenceGateBlock)
+                 ? getOnPos.atY(Mth.floor(this.position.y - offset))
+                 : getOnPos;
+diff --git a/net/minecraft/world/entity/InsideBlockEffectApplier.java b/net/minecraft/world/entity/InsideBlockEffectApplier.java
+index c2f124383be06ae777c1ee7f0820c959c8359f87..552e622ba7dbaa627d9c9b0b89ccaa8b01c939b5 100644
+--- a/net/minecraft/world/entity/InsideBlockEffectApplier.java
++++ b/net/minecraft/world/entity/InsideBlockEffectApplier.java
+@@ -65,7 +65,13 @@ public interface InsideBlockEffectApplier {
+             this.lastStep = -1;
+         }
+ 
++        private boolean quireRecorded; // Quire - anything recorded since the last flush (otherwise flushing moves nothing)
++
+         private void flushStep() {
++            if (!this.quireRecorded) {
++                return; // Quire - every list and the map are empty
++            }
++            this.quireRecorded = false;
+             for (InsideBlockEffectType type : APPLY_ORDER) {
+                 List<Consumer<Entity>> beforeEffects = this.beforeEffectsInStep.get(type);
+                 this.finalEffects.addAll(beforeEffects);
+@@ -83,16 +89,19 @@ public interface InsideBlockEffectApplier {
+         @Override
+         public void apply(final InsideBlockEffectType type) {
+             this.effectsInStep.put(type, recorded(type)); // Paper - track position inside effect was triggered on
++            this.quireRecorded = true; // Quire
+         }
+ 
+         @Override
+         public void runBefore(final InsideBlockEffectType type, final Consumer<Entity> effect) {
+             this.beforeEffectsInStep.get(type).add(effect);
++            this.quireRecorded = true; // Quire
+         }
+ 
+         @Override
+         public void runAfter(final InsideBlockEffectType type, final Consumer<Entity> effect) {
+             this.afterEffectsInStep.get(type).add(effect);
++            this.quireRecorded = true; // Quire
+         }
+ 
+         // Paper start - track position inside effect was triggered on
+diff --git a/net/minecraft/world/entity/ai/Brain.java b/net/minecraft/world/entity/ai/Brain.java
+index 2b22bbfac4e324969e7cff368c690ee915d33a66..7a9d326719998a5b4ffe544d9b380ddf049a1b09 100644
+--- a/net/minecraft/world/entity/ai/Brain.java
++++ b/net/minecraft/world/entity/ai/Brain.java
+@@ -38,6 +38,7 @@ import org.jspecify.annotations.Nullable;
+ public class Brain<E extends LivingEntity> {
+     private static final int SCHEDULE_UPDATE_DELAY = 20;
+     private final Map<MemoryModuleType<?>, MemorySlot<?>> memories = Maps.newHashMap();
++    private MemorySlot<?>[] quireSlots = new MemorySlot<?>[0]; // Quire - indexed by MemoryModuleType.quireIndex
+     private final Map<SensorType<? extends Sensor<? super E>>, Sensor<? super E>> sensors = Maps.newLinkedHashMap();
+     private final Map<Integer, Map<Activity, Set<BehaviorControl<? super E>>>> availableBehaviorsByPriority = Maps.newTreeMap();
+     private @Nullable EnvironmentAttribute<Activity> schedule;
+@@ -45,6 +46,29 @@ public class Brain<E extends LivingEntity> {
+     private final Map<Activity, Set<MemoryModuleType<?>>> activityMemoriesToEraseWhenStopped = Maps.newHashMap();
+     private Set<Activity> coreActivities = Sets.newHashSet();
+     private final Set<Activity> activeActivities = Sets.newHashSet();
++    // Quire start - bit mask mirror of activeActivities (the set only changes in setActiveActivity); -1 = not usable
++    private long quireActiveMask = 0L;
++
++    private void quire$updateActiveMask() {
++        long mask = 0L;
++        for (final Activity active : this.activeActivities) {
++            if (active.quireIndex >= 64) {
++                this.quireActiveMask = -1L;
++                return;
++            }
++            mask |= 1L << active.quireIndex;
++        }
++        this.quireActiveMask = mask;
++    }
++
++    private boolean quire$isActive(final Activity activity) {
++        final long mask = this.quireActiveMask;
++        if (mask == -1L || activity.quireIndex >= 64) {
++            return this.activeActivities.contains(activity);
++        }
++        return (mask & (1L << activity.quireIndex)) != 0L;
++    }
++    // Quire end
+     private Activity defaultActivity = Activity.IDLE;
+     private long lastScheduleUpdate = -9999L;
+ 
+@@ -102,7 +126,16 @@ public class Brain<E extends LivingEntity> {
+     }
+ 
+     private void registerMemory(final MemoryModuleType<?> memoryType) {
+-        this.memories.putIfAbsent(memoryType, MemorySlot.create());
++        // Quire start - slot array mirror of the memories map (entries are only ever added, here)
++        final MemorySlot<?> slot = MemorySlot.create();
++        if (this.memories.putIfAbsent(memoryType, slot) == null) {
++            final int index = memoryType.quireIndex;
++            if (index >= this.quireSlots.length) {
++                this.quireSlots = java.util.Arrays.copyOf(this.quireSlots, Math.max(index + 1, this.quireSlots.length * 2));
++            }
++            this.quireSlots[index] = slot;
++        }
++        // Quire end
+     }
+ 
+     public Brain() {
+@@ -135,7 +168,11 @@ public class Brain<E extends LivingEntity> {
+     }
+ 
+     private <T> @Nullable MemorySlot<T> getMemorySlotIfPresent(final MemoryModuleType<T> memoryType) {
+-        return (MemorySlot<T>)this.memories.get(memoryType);
++        // Quire start - array lookup, same result as memories.get
++        final int index = memoryType.quireIndex;
++        final MemorySlot<?>[] slots = this.quireSlots;
++        return index < slots.length ? (MemorySlot<T>)slots[index] : null;
++        // Quire end
+     }
+ 
+     private <T> MemorySlot<T> getMemorySlot(final MemoryModuleType<T> memoryType) {
+@@ -309,6 +346,7 @@ public class Brain<E extends LivingEntity> {
+             this.activeActivities.clear();
+             this.activeActivities.addAll(this.coreActivities);
+             this.activeActivities.add(activity);
++            this.quire$updateActiveMask(); // Quire
+         }
+     }
+ 
+@@ -379,7 +417,7 @@ public class Brain<E extends LivingEntity> {
+     }
+ 
+     public boolean isActive(final Activity activity) {
+-        return this.activeActivities.contains(activity);
++        return this.quire$isActive(activity); // Quire - mask
+     }
+ 
+     public void tick(final ServerLevel level, final E body) {
+@@ -413,7 +451,7 @@ public class Brain<E extends LivingEntity> {
+         for (Map<Activity, Set<BehaviorControl<? super E>>> behavioursByActivities : this.availableBehaviorsByPriority.values()) {
+             for (Entry<Activity, Set<BehaviorControl<? super E>>> behavioursForActivity : behavioursByActivities.entrySet()) {
+                 Activity activity = behavioursForActivity.getKey();
+-                if (this.activeActivities.contains(activity)) {
++                if (this.quire$isActive(activity)) { // Quire - mask
+                     for (BehaviorControl<? super E> behavior : behavioursForActivity.getValue()) {
+                         if (behavior.getStatus() == Behavior.Status.STOPPED) {
+                             behavior.tryStart(level, body, time);
+diff --git a/net/minecraft/world/entity/ai/memory/MemoryModuleType.java b/net/minecraft/world/entity/ai/memory/MemoryModuleType.java
+index 2be1f8d22a3957302572817ff4451db08407cc5d..2bfa312fffaed52d0ad8541001bdec4403140846 100644
+--- a/net/minecraft/world/entity/ai/memory/MemoryModuleType.java
++++ b/net/minecraft/world/entity/ai/memory/MemoryModuleType.java
+@@ -152,6 +152,11 @@ public class MemoryModuleType<U> {
+     private final Optional<Codec<ExpirableValue<U>>> codec;
+ 
+     @VisibleForTesting
++    private static final class QuireIndex { // holder: initialised on first use, before the static constants above are
++        static final java.util.concurrent.atomic.AtomicInteger NEXT = new java.util.concurrent.atomic.AtomicInteger();
++    }
++    public final int quireIndex = QuireIndex.NEXT.getAndIncrement(); // Quire - dense index for Brain's slot array
++
+     public MemoryModuleType(final Optional<Codec<U>> codec) {
+         this.codec = codec.map(ExpirableValue::codec);
+     }
+diff --git a/net/minecraft/world/entity/schedule/Activity.java b/net/minecraft/world/entity/schedule/Activity.java
+index 23a614ea83abf7abdbf4f5b34751d08962c46cee..c4d48261c8f5ef06f462dd3fab9bb4aa20210007 100644
+--- a/net/minecraft/world/entity/schedule/Activity.java
++++ b/net/minecraft/world/entity/schedule/Activity.java
+@@ -33,6 +33,11 @@ public class Activity {
+     private final String name;
+     private final int hashCode;
+ 
++    private static final class QuireIndex { // holder: initialised on first use, before the static constants above are
++        static final java.util.concurrent.atomic.AtomicInteger NEXT = new java.util.concurrent.atomic.AtomicInteger();
++    }
++    public final int quireIndex = QuireIndex.NEXT.getAndIncrement(); // Quire - bit in Brain's active activity mask
++
+     private Activity(final String name) {
+         this.name = name;
+         this.hashCode = name.hashCode();
+diff --git a/net/minecraft/world/level/block/Block.java b/net/minecraft/world/level/block/Block.java
+index 1cb29696236b4a663de4facb386b685a315d02d0..ca0f366ed6a4ad861f5d090d9991e2b5a0e43b27 100644
+--- a/net/minecraft/world/level/block/Block.java
++++ b/net/minecraft/world/level/block/Block.java
+@@ -682,16 +682,20 @@ public class Block extends BlockBehaviour implements ItemLike {
+     // Quire start - cached membership of tags checked on hot entity paths
+     public static final int QUIRE_TAG_CLIMBABLE = 1;
+     public static final int QUIRE_TAG_CAN_GLIDE_THROUGH = 2;
+-    // (tag generation << 2) | flag bits; -1 = not computed. A single int so racing readers never see a torn value.
++    public static final int QUIRE_TAG_FENCES = 4;
++    public static final int QUIRE_TAG_WALLS = 8;
++    // (tag generation << 4) | flag bits; -1 = not computed. A single int so racing readers never see a torn value.
+     private int quireHotTags = -1;
+ 
+     public final boolean quire$hasHotTag(final int flag) {
+-        final int generation = dev.quire.util.TagGeneration.get();
++        final int generation = dev.quire.util.TagGeneration.get() & 0x07FFFFFF; // 27 bits: never equal to the -1 marker's
+         int cached = this.quireHotTags;
+-        if (cached == -1 || (cached >>> 2) != generation) {
+-            cached = (generation << 2)
++        if (cached == -1 || (cached >>> 4) != generation) {
++            cached = (generation << 4)
+                 | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.CLIMBABLE) ? QUIRE_TAG_CLIMBABLE : 0)
+-                | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.CAN_GLIDE_THROUGH) ? QUIRE_TAG_CAN_GLIDE_THROUGH : 0);
++                | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.CAN_GLIDE_THROUGH) ? QUIRE_TAG_CAN_GLIDE_THROUGH : 0)
++                | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.FENCES) ? QUIRE_TAG_FENCES : 0)
++                | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.WALLS) ? QUIRE_TAG_WALLS : 0);
+             this.quireHotTags = cached;
+         }
+         return (cached & flag) != 0;
+diff --git a/net/minecraft/world/level/chunk/PalettedContainer.java b/net/minecraft/world/level/chunk/PalettedContainer.java
+index 1f7cd0cbfaec46b0588d4be1be6453f37503760a..06aa8658f73499b2e125c9aa77cf8e395471c11d 100644
+--- a/net/minecraft/world/level/chunk/PalettedContainer.java
++++ b/net/minecraft/world/level/chunk/PalettedContainer.java
+@@ -145,6 +145,10 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         return storage.getRaw().clone();
+     }
+ 
++    public synchronized dev.quire.memory.@org.jspecify.annotations.Nullable FrozenBitStorage quire$frozenStorage() {
++        return this.data.storage instanceof dev.quire.memory.FrozenBitStorage frozen ? frozen : null;
++    }
++
+     public synchronized SimpleBitStorage quire$plainStorage() {
+         return this.data.storage instanceof SimpleBitStorage storage ? storage : null;
+     }

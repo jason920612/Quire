@@ -89,8 +89,15 @@ public abstract class FrozenBitStorage implements BitStorage {
     @Override
     public final int get(final int index) {
         final SimpleBitStorage live = this.inflated;
-        return live != null ? live.get(index) : this.frozenGet(index);
+        if (live != null) {
+            return live.get(index);
+        }
+        this.reads++; // racy on purpose: a heat estimate for the compactor
+        return this.frozenGet(index);
     }
+
+    /** Game reads (not peeks) since the compactor last looked; it inflates storages that are read often. */
+    public int reads;
 
     public final int peek(final int index) {
         final SimpleBitStorage live = this.inflated;

@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 22:07:23 +0800
+Subject: [PATCH] Block counting: coordinates only for randomly ticking states
+
+
+diff --git a/net/minecraft/util/SimpleBitStorage.java b/net/minecraft/util/SimpleBitStorage.java
+index 0a19368815deb47bc015c293386fecf78573a08f..ac679dd753b4bf708fb637e305d7c9ab74e8d1f8 100644
+--- a/net/minecraft/util/SimpleBitStorage.java
++++ b/net/minecraft/util/SimpleBitStorage.java
+@@ -422,7 +422,7 @@ public class SimpleBitStorage implements BitStorage {
+         final int size = this.size;
+ 
+         if (bits <= 12) { // Quire - count first, then fill exact-size lists (no repeated growth); same map, same insertion order
+-            return this.quire$countEntriesExact(bits <= 6 ? 1 << bits : 1 << 6);
++            return this.quire$countEntriesExact(bits <= 6 ? 1 << bits : 1 << 6, null);
+         }
+         if (bits <= 6) {
+             final it.unimi.dsi.fastutil.shorts.ShortArrayList[] byId = new it.unimi.dsi.fastutil.shorts.ShortArrayList[1 << bits];
+@@ -477,7 +477,17 @@ public class SimpleBitStorage implements BitStorage {
+     }
+ 
+     // Quire start - exact-size block counting
+-    private it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> quire$countEntriesExact(final int mapCapacity) {
++    private static final short[] QUIRE_UNFILLED = new short[4096]; // never written or read: backs lists used only for their size
++
++    /** moonrise$countEntries, but only ids accepted by {@code positions} (null: all) get their coordinates; the others get a list of the right size only. */
++    public it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> quire$countEntries(final java.util.function.IntPredicate positions) {
++        if (this.bits > 12 || this.size > 4096) {
++            return this.moonrise$countEntries();
++        }
++        return this.quire$countEntriesExact(this.bits <= 6 ? 1 << this.bits : 1 << 6, positions);
++    }
++
++    private it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> quire$countEntriesExact(final int mapCapacity, final java.util.function.@org.jspecify.annotations.Nullable IntPredicate positions) {
+         final int valuesPerLong = this.valuesPerLong;
+         final int bits = this.bits;
+         final long mask = (1L << bits) - 1L;
+@@ -499,18 +509,29 @@ public class SimpleBitStorage implements BitStorage {
+         }
+         final short[][] coords = new short[1 << bits][];
+         final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> ret = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(mapCapacity);
++        boolean anyPositions = false;
++        final int[] sizes = new int[distinct];
+         for (int k = 0; k < distinct; ++k) {
+             final int id = firstOrder[k];
+-            coords[id] = new short[counts[id]];
++            sizes[k] = counts[id];
++            if (positions == null || positions.test(id)) {
++                coords[id] = new short[counts[id]];
++                anyPositions = true;
++            }
+             counts[id] = 0; // reused as fill position
+         }
+-        for (int i = 0; i < index; ++i) {
+-            final int id = ids[i];
+-            coords[id][counts[id]++] = (short) i;
++        if (anyPositions) {
++            for (int i = 0; i < index; ++i) {
++                final int id = ids[i];
++                final short[] c = coords[id];
++                if (c != null) {
++                    c[counts[id]++] = (short) i;
++                }
++            }
+         }
+         for (int k = 0; k < distinct; ++k) {
+             final int id = firstOrder[k];
+-            ret.put(id, it.unimi.dsi.fastutil.shorts.ShortArrayList.wrap(coords[id], counts[id]));
++            ret.put(id, it.unimi.dsi.fastutil.shorts.ShortArrayList.wrap(coords[id] != null ? coords[id] : QUIRE_UNFILLED, sizes[k]));
+         }
+         return ret;
+     }
+diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
+index c1670a9e1d8362c47b8b00c5c73b8f7b0fb1f168..91eb7f613cbbcc5253a3171468ad94504e21e0a2 100644
+--- a/net/minecraft/world/level/chunk/LevelChunkSection.java
++++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
+@@ -222,7 +222,9 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+                 counts = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(1);
+                 counts.put(0, FULL_LIST);
+             } else {
+-                counts = ((ca.spottedleaf.moonrise.patches.block_counting.BlockCountingBitStorage)storage).moonrise$countEntries();
++                counts = storage instanceof net.minecraft.util.SimpleBitStorage simple
++                    ? simple.quire$countEntries(id -> palette.valueFor(id).isRandomlyTicking()) // Quire - coordinates only where used
++                    : ((ca.spottedleaf.moonrise.patches.block_counting.BlockCountingBitStorage)storage).moonrise$countEntries();
+             }
+ 
+             for (final java.util.Iterator<it.unimi.dsi.fastutil.ints.Int2ObjectMap.Entry<it.unimi.dsi.fastutil.shorts.ShortArrayList>> iterator = counts.int2ObjectEntrySet().fastIterator(); iterator.hasNext();) {

@@ -40,6 +40,9 @@ public final class LightFreezer {
     public static final LongAdder RAN = new LongAdder();
     public static final LongAdder CANDIDATE_SCANS = new LongAdder();
 
+    private static final java.util.WeakHashMap<ServerLevel, long[]> PACING = new java.util.WeakHashMap<>();
+    private static final long PASS_INTERVAL_NANOS = 5_000_000_000L;
+
     private LightFreezer() {
     }
 
@@ -61,9 +64,20 @@ public final class LightFreezer {
                 continue;
             }
             final int[] cursor = CURSORS.computeIfAbsent(level, l -> new int[1]);
+            // pacing: after a full pass, the next starts PASS_INTERVAL later (nibbles only become candidates after
+            // seconds of idleness; scanning every tick cost an idle server a constant slice of each tick)
+            final long[] pace = PACING.computeIfAbsent(level, l -> new long[2]); // [visited in pass, next pass start]
+            if (pace[0] == 0L && System.nanoTime() - pace[1] < 0L) {
+                continue;
+            }
             for (int visited = 0; visited < size && PENDING.size() < MAX_QUEUED; visited++) {
                 if ((visited & 15) == 0 && System.nanoTime() > deadline) {
                     return;
+                }
+                if (++pace[0] >= size) {
+                    pace[0] = 0L;
+                    pace[1] = System.nanoTime() + PASS_INTERVAL_NANOS;
+                    visited = size; // pass complete: this is its last chunk
                 }
                 cursor[0] = (cursor[0] + 1) % size;
                 CANDIDATE_SCANS.increment();
