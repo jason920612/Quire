@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 21:38:58 +0800
+Subject: [PATCH] Virtual fresh advancement progress, exact-size block
+ counting, shared waypoint packets, scratch arrays for light and biome search
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+index b669615d856da79a8aedefba8c23ff394427e04a..982807ed5ec540c4ab397be3b9d30a5b8a5b8f55 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+@@ -94,8 +94,10 @@ public final class SWMRNibbleArray {
+     /** Wall clock ({@link dev.quire.memory.LightFreezer#clock()}) of the last published update, for the idle test of the freezer. */
+     public int quireLastUpdate = dev.quire.memory.LightFreezer.clock() - (1 << 20); // never updated: long idle
+ 
++    private static final ThreadLocal<int[]> QUIRE_SCRATCH = ThreadLocal.withInitial(() -> new int[4096]); // not retained by Sparse4096
++
+     private static dev.quire.memory.Sparse4096 encode(final byte[] bytes) {
+-        final int[] v = new int[4096];
++        final int[] v = QUIRE_SCRATCH.get();
+         for (int i = 0; i < 4096; ++i) {
+             v[i] = (bytes[i >>> 1] >>> ((i & 1) << 2)) & 0xF;
+         }
+@@ -104,7 +106,7 @@ public final class SWMRNibbleArray {
+ 
+     private static byte[] decode(final dev.quire.memory.Sparse4096 sparse) {
+         final byte[] bytes = new byte[ARRAY_SIZE];
+-        final int[] values = new int[4096];
++        final int[] values = QUIRE_SCRATCH.get();
+         sparse.decodeAll(values);
+         for (int i = 0; i < ARRAY_SIZE; ++i) {
+             bytes[i] = (byte)(values[i << 1] | (values[(i << 1) | 1] << 4));
+diff --git a/net/minecraft/advancements/AdvancementProgress.java b/net/minecraft/advancements/AdvancementProgress.java
+index 9e14bbaa8a83236487ad750cfe42aa74cec4c7ef..a92c8b8c68f1cf9d1023876fce2667986fa47692 100644
+--- a/net/minecraft/advancements/AdvancementProgress.java
++++ b/net/minecraft/advancements/AdvancementProgress.java
+@@ -108,6 +108,21 @@ public class AdvancementProgress implements Comparable<AdvancementProgress> {
+         this.values[index] = progress;
+     }
+ 
++    /** isDone() of a fresh progress (update(requirements) on a new instance): no criterion is done. */
++    public static boolean quire$freshIsDone(final AdvancementRequirements requirements) {
++        return requirements.test(name -> false);
++    }
++
++    /** Whether a fresh progress for the requirements has the criterion (getCriterion(name) != null; it is not done). */
++    public static boolean quire$freshHasCriterion(final AdvancementRequirements requirements, final String name) {
++        for (final String key : layout(requirements).keys()) {
++            if (key.equals(name)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     /** The criteria as a map (for serialization), in iteration order. */
+     public Map<String, CriterionProgress> quire$criteriaMap() {
+         final Map<String, CriterionProgress> map = new java.util.LinkedHashMap<>(Math.max(2, this.keys.length * 2));
+diff --git a/net/minecraft/server/PlayerAdvancements.java b/net/minecraft/server/PlayerAdvancements.java
+index bb2c68ec02e1831faa73bbf4cf1feda399aba06f..85004fb04cde064e9e24083e7ac166390c9f3634 100644
+--- a/net/minecraft/server/PlayerAdvancements.java
++++ b/net/minecraft/server/PlayerAdvancements.java
+@@ -232,6 +232,19 @@ public class PlayerAdvancements {
+     }
+ 
+     private void registerListeners(final AdvancementHolder holder) {
++        // Quire start - fresh progress stays virtual (not stored) until something changes it
++        if (!this.progress.containsKey(holder)) {
++            final net.minecraft.advancements.AdvancementRequirements requirements = holder.value().requirements();
++            if (!AdvancementProgress.quire$freshIsDone(requirements)) {
++                for (Entry<String, Criterion<?>> entry : holder.value().criteria().entrySet()) {
++                    if (AdvancementProgress.quire$freshHasCriterion(requirements, entry.getKey())) {
++                        this.addListener(entry.getValue(), QUIRE_TRIGGER_KEYS.intern(new PlayerAdvancements.TriggerInstanceKey(holder, entry.getKey())));
++                    }
++                }
++            }
++            return;
++        }
++        // Quire end
+         AdvancementProgress advancementProgress = this.getOrStartProgress(holder);
+         if (!advancementProgress.isDone()) {
+             for (Entry<String, Criterion<?>> entry : holder.value().criteria().entrySet()) {
+@@ -268,7 +281,7 @@ public class PlayerAdvancements {
+ 
+             for (AdvancementHolder holder : this.progressChanged) {
+                 if (this.visible.contains(holder)) {
+-                    progress.put(holder.id(), this.progress.get(holder));
++                    progress.put(holder.id(), this.quire$progressOrFresh(holder)); // Quire - virtual fresh progress
+                 }
+             }
+ 
+@@ -297,6 +310,23 @@ public class PlayerAdvancements {
+         }
+     }
+ 
++    // Quire start - virtual fresh progress
++    private boolean quire$isDone(final AdvancementHolder holder) {
++        final AdvancementProgress progress = this.progress.get(holder);
++        return progress != null ? progress.isDone() : AdvancementProgress.quire$freshIsDone(holder.value().requirements());
++    }
++
++    private AdvancementProgress quire$progressOrFresh(final AdvancementHolder holder) {
++        final AdvancementProgress progress = this.progress.get(holder);
++        if (progress != null) {
++            return progress;
++        }
++        final AdvancementProgress fresh = new AdvancementProgress();
++        fresh.update(holder.value().requirements());
++        return fresh;
++    }
++    // Quire end - virtual fresh progress
++
+     public AdvancementProgress getOrStartProgress(final AdvancementHolder advancement) {
+         AdvancementProgress progress = this.progress.get(advancement);
+         if (progress == null) {
+@@ -313,14 +343,13 @@ public class PlayerAdvancements {
+     }
+ 
+     private void updateTreeVisibility(final AdvancementNode root, final Set<AdvancementNode> added, final Set<Identifier> removed) {
+-        AdvancementVisibilityEvaluator.evaluateVisibility(root, node -> this.getOrStartProgress(node.holder()).isDone(), (node, shouldBeVisible) -> {
++        AdvancementVisibilityEvaluator.evaluateVisibility(root, node -> this.quire$isDone(node.holder()), (node, shouldBeVisible) -> { // Quire - virtual fresh progress
+             AdvancementHolder advancement = node.holder();
+             if (shouldBeVisible) {
+                 if (this.visible.add(advancement)) {
+                     added.add(node);
+-                    if (this.progress.containsKey(advancement)) {
+-                        this.progressChanged.add(advancement);
+-                    }
++                    // Quire - the done test above ran on this node and (in vanilla) stored its progress, so it is always present
++                    this.progressChanged.add(advancement);
+                 }
+             } else if (this.visible.remove(advancement)) {
+                 removed.add(advancement.id());
+diff --git a/net/minecraft/util/SimpleBitStorage.java b/net/minecraft/util/SimpleBitStorage.java
+index ff663f8b15c10662ee39c8f27140d8fcda9de715..0a19368815deb47bc015c293386fecf78573a08f 100644
+--- a/net/minecraft/util/SimpleBitStorage.java
++++ b/net/minecraft/util/SimpleBitStorage.java
+@@ -421,6 +421,9 @@ public class SimpleBitStorage implements BitStorage {
+         final long mask = (1L << bits) - 1L;
+         final int size = this.size;
+ 
++        if (bits <= 12) { // Quire - count first, then fill exact-size lists (no repeated growth); same map, same insertion order
++            return this.quire$countEntriesExact(bits <= 6 ? 1 << bits : 1 << 6);
++        }
+         if (bits <= 6) {
+             final it.unimi.dsi.fastutil.shorts.ShortArrayList[] byId = new it.unimi.dsi.fastutil.shorts.ShortArrayList[1 << bits];
+             final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> ret = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(1 << bits);
+@@ -472,6 +475,46 @@ public class SimpleBitStorage implements BitStorage {
+             return ret;
+         }
+     }
++
++    // Quire start - exact-size block counting
++    private it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> quire$countEntriesExact(final int mapCapacity) {
++        final int valuesPerLong = this.valuesPerLong;
++        final int bits = this.bits;
++        final long mask = (1L << bits) - 1L;
++        final int size = this.size;
++        final int[] ids = new int[size];
++        final int[] counts = new int[1 << bits];
++        final int[] firstOrder = new int[Math.min(1 << bits, size)];
++        int distinct = 0;
++        int index = 0;
++        for (long value : this.data) {
++            for (int li = 0; li < valuesPerLong && index < size; ++li) {
++                final int id = (int) (value & mask);
++                value >>= bits;
++                ids[index++] = id;
++                if (counts[id]++ == 0) {
++                    firstOrder[distinct++] = id;
++                }
++            }
++        }
++        final short[][] coords = new short[1 << bits][];
++        final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.shorts.ShortArrayList> ret = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(mapCapacity);
++        for (int k = 0; k < distinct; ++k) {
++            final int id = firstOrder[k];
++            coords[id] = new short[counts[id]];
++            counts[id] = 0; // reused as fill position
++        }
++        for (int i = 0; i < index; ++i) {
++            final int id = ids[i];
++            coords[id][counts[id]++] = (short) i;
++        }
++        for (int k = 0; k < distinct; ++k) {
++            final int id = firstOrder[k];
++            ret.put(id, it.unimi.dsi.fastutil.shorts.ShortArrayList.wrap(coords[id], counts[id]));
++        }
++        return ret;
++    }
++    // Quire end - exact-size block counting
+     // Paper end - block counting
+ 
+     public static class InitializationException extends RuntimeException {
+diff --git a/net/minecraft/world/entity/LivingEntity.java b/net/minecraft/world/entity/LivingEntity.java
+index 907ad49403b90e004bfcd24be1738d63be24ce86..e099b49a768f75f78cb77ca4b14f6573aba21bcf 100644
+--- a/net/minecraft/world/entity/LivingEntity.java
++++ b/net/minecraft/world/entity/LivingEntity.java
+@@ -158,6 +158,10 @@ public abstract class LivingEntity extends Entity implements Attackable, Waypoin
+     // Quire - waypoint attribute values cached per waypoint flush (see WaypointTransmitter)
+     public int quireWaypointTxEpoch, quireWaypointRxEpoch;
+     public double quireWaypointTx, quireWaypointRx;
++    // Quire - last waypoint position update packet sent for this source (shared by all its receivers)
++    public net.minecraft.network.protocol.game.ClientboundTrackedWaypointPacket quireWpPacket;
++    public net.minecraft.core.BlockPos quireWpPacketPos;
++    public net.minecraft.world.waypoints.Waypoint.Icon quireWpPacketIcon;
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private static final String TAG_ACTIVE_EFFECTS = "active_effects";
+     public static final String TAG_ATTRIBUTES = "attributes";
+diff --git a/net/minecraft/world/level/biome/Climate.java b/net/minecraft/world/level/biome/Climate.java
+index 1f0c020207b5b1eb989ddad742e006a2c7fc2b01..bc8e4a9ec00e3f4b7af760fc79cd517048437dca 100644
+--- a/net/minecraft/world/level/biome/Climate.java
++++ b/net/minecraft/world/level/biome/Climate.java
+@@ -390,8 +390,19 @@ public class Climate {
+             return bounds;
+         }
+ 
++        private static final ThreadLocal<long[]> QUIRE_TARGET = ThreadLocal.withInitial(() -> new long[7]); // Quire - search only reads it
++
+         public T search(final Climate.TargetPoint target, final Climate.DistanceMetric<T> distanceMetric) {
+-            long[] targetArray = target.toParameterArray();
++            // Quire start - reuse the parameter array (same values as target.toParameterArray())
++            final long[] targetArray = QUIRE_TARGET.get();
++            targetArray[0] = target.temperature();
++            targetArray[1] = target.humidity();
++            targetArray[2] = target.continentalness();
++            targetArray[3] = target.erosion();
++            targetArray[4] = target.depth();
++            targetArray[5] = target.weirdness();
++            targetArray[6] = 0L;
++            // Quire end
+             Climate.RTree.Leaf<T> leaf = this.root.search(targetArray, this.lastResult.get(), distanceMetric);
+             this.lastResult.set(leaf);
+             return leaf.value;
+diff --git a/net/minecraft/world/waypoints/WaypointTransmitter.java b/net/minecraft/world/waypoints/WaypointTransmitter.java
+index ef54c06dfdb5faf1cf374109cc7c6a8f1675ec1a..1f54767ee177a17b215ac5c08f231e78c8750745 100644
+--- a/net/minecraft/world/waypoints/WaypointTransmitter.java
++++ b/net/minecraft/world/waypoints/WaypointTransmitter.java
+@@ -172,7 +172,16 @@ public interface WaypointTransmitter extends Waypoint {
+         public void update() {
+             BlockPos currentPosition = this.source.blockPosition();
+             if (currentPosition.getX() != this.lastX || currentPosition.getY() != this.lastY || currentPosition.getZ() != this.lastZ) { // Quire - same as distManhattan > 0
+-                this.receiver.connection.send(ClientboundTrackedWaypointPacket.updateWaypointPosition(this.source.getUUID(), this.icon, currentPosition));
++                // Quire start - one (immutable) packet per source position and icon, shared by all receivers
++                ClientboundTrackedWaypointPacket packet = this.source.quireWpPacket;
++                if (packet == null || this.source.quireWpPacketPos != currentPosition || this.source.quireWpPacketIcon != this.icon) {
++                    packet = ClientboundTrackedWaypointPacket.updateWaypointPosition(this.source.getUUID(), this.icon, currentPosition);
++                    this.source.quireWpPacket = packet;
++                    this.source.quireWpPacketPos = currentPosition;
++                    this.source.quireWpPacketIcon = this.icon;
++                }
++                this.receiver.connection.send(packet);
++                // Quire end
+                 this.lastX = currentPosition.getX();
+                 this.lastY = currentPosition.getY();
+                 this.lastZ = currentPosition.getZ();
