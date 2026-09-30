@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 1 Oct 2026 01:22:08 +0800
+Subject: [PATCH] POI search: bitset seen set and per-column poi chunk; flat
+ Brain behaviour arrays
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java
+index 85d80b3952a76b0ca7f67401a659cf35dd55b082..1488bcb28b7abeecfed658f718020d034430638f 100644
+--- a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java
++++ b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java
+@@ -359,21 +359,28 @@ public final class PoiAccess {
+         final int centerZ = sourcePosition.getZ() >> 4;
+         final long centerKey = CoordinateUtils.getChunkSectionKey(centerX, centerY, centerZ);
+ 
+-        final LongArrayFIFOQueue queue = new LongArrayFIFOQueue();
+-        final LongOpenHashSet seen = new LongOpenHashSet();
+-        seen.add(centerKey);
+-        queue.enqueue(centerKey);
+-
+-        while (!queue.isEmpty()) {
+-            final long key = queue.dequeueLong();
+-            final int sectionX = CoordinateUtils.getChunkSectionX(key);
+-            final int sectionY = CoordinateUtils.getChunkSectionY(key);
+-            final int sectionZ = CoordinateUtils.getChunkSectionZ(key);
++        // Quire start - same breadth-first order as before, with the seen set as a bitset over the search box (keys
++        // outside it were dequeued and skipped, so they are no longer queued) and each column's poi chunk resolved
++        // once per search instead of once per section
++        final int boxX = upperX - lowerX + 1, boxY = upperY - lowerY + 1, boxZ = upperZ - lowerZ + 1;
++        final long[] seen = new long[(boxX * boxY * boxZ + 63) >>> 6];
++        final int[] queue = new int[boxX * boxY * boxZ];
++        int queueHead = 0, queueTail = 0;
++        final ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk[] columns = new ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk[boxX * boxZ];
++        final boolean[] columnResolved = new boolean[boxX * boxZ];
++        final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager holderManager =
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)poiStorage.moonrise$getWorld()).moonrise$getChunkTaskScheduler().chunkHolderManager;
++        {
++            final int centerIndex = ((centerY - lowerY) * boxZ + (centerZ - lowerZ)) * boxX + (centerX - lowerX);
++            seen[centerIndex >>> 6] |= 1L << centerIndex;
++            queue[queueTail++] = centerIndex;
++        }
+ 
+-            if (sectionX < lowerX || sectionX > upperX || sectionY < lowerY || sectionY > upperY || sectionZ < lowerZ || sectionZ > upperZ) {
+-                // out of bound chunk
+-                continue;
+-            }
++        while (queueHead < queueTail) {
++            final int index = queue[queueHead++];
++            final int sectionX = lowerX + index % boxX;
++            final int sectionZ = lowerZ + (index / boxX) % boxZ;
++            final int sectionY = lowerY + index / (boxX * boxZ);
+ 
+             final double sectionDistanceSquared = getSmallestDistanceSquared(
+                     (double)(sectionX << 4),
+@@ -402,16 +409,33 @@ public final class PoiAccess {
+                         final int neighbourX = sectionX + dx;
+                         final int neighbourY = sectionY + dy;
+                         final int neighbourZ = sectionZ + dz;
++                        if (neighbourX < lowerX || neighbourX > upperX || neighbourY < lowerY || neighbourY > upperY || neighbourZ < lowerZ || neighbourZ > upperZ) {
++                            continue; // out of bound chunk
++                        }
+ 
+-                        final long neighbourKey = CoordinateUtils.getChunkSectionKey(neighbourX, neighbourY, neighbourZ);
+-                        if (seen.add(neighbourKey)) {
+-                            queue.enqueue(neighbourKey);
++                        final int neighbourIndex = ((neighbourY - lowerY) * boxZ + (neighbourZ - lowerZ)) * boxX + (neighbourX - lowerX);
++                        if ((seen[neighbourIndex >>> 6] & (1L << neighbourIndex)) == 0L) {
++                            seen[neighbourIndex >>> 6] |= 1L << neighbourIndex;
++                            queue[queueTail++] = neighbourIndex;
+                         }
+                     }
+                 }
+             }
+ 
+-            final Optional<PoiSection> poiSectionOptional = load ? poiStorage.getOrLoad(key) : poiStorage.get(key);
++            // what poiStorage.getOrLoad(key) / get(key) returned, per column
++            final int column = (sectionZ - lowerZ) * boxX + (sectionX - lowerX);
++            if (!columnResolved[column]) {
++                columnResolved[column] = true;
++                ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(poiStorage.moonrise$getWorld(), sectionX, sectionZ, "Accessing poi chunk off-main");
++                ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk poiChunk = holderManager.getPoiChunkIfLoaded(sectionX, sectionZ, true);
++                if (poiChunk == null && load) {
++                    poiChunk = holderManager.loadPoiChunk(sectionX, sectionZ);
++                }
++                columns[column] = poiChunk;
++            }
++            final ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk poiChunk = columns[column];
++            final Optional<PoiSection> poiSectionOptional = poiChunk == null ? Optional.empty() : poiChunk.getSectionForVanilla(sectionY);
++            // Quire end
+ 
+             if (poiSectionOptional == null || !poiSectionOptional.isPresent()) {
+                 continue;
+diff --git a/net/minecraft/world/entity/ai/Brain.java b/net/minecraft/world/entity/ai/Brain.java
+index 7a9d326719998a5b4ffe544d9b380ddf049a1b09..5828417afc39777c103d5558dde4a7fa4241a895 100644
+--- a/net/minecraft/world/entity/ai/Brain.java
++++ b/net/minecraft/world/entity/ai/Brain.java
+@@ -305,19 +305,52 @@ public class Brain<E extends LivingEntity> {
+     public List<BehaviorControl<? super E>> getRunningBehaviors() {
+         List<BehaviorControl<? super E>> runningBehaviours = new ObjectArrayList<>();
+ 
+-        for (Map<Activity, Set<BehaviorControl<? super E>>> behavioursByActivities : this.availableBehaviorsByPriority.values()) {
+-            for (Set<BehaviorControl<? super E>> behaviors : behavioursByActivities.values()) {
+-                for (BehaviorControl<? super E> behavior : behaviors) {
+-                    if (behavior.getStatus() == Behavior.Status.RUNNING) {
+-                        runningBehaviours.add(behavior);
+-                    }
+-                }
++        // Quire start - flat view, same order as the nested maps
++        final BehaviorControl<? super E>[] behaviors = this.quire$flatBehaviors();
++        for (final BehaviorControl<? super E> behavior : behaviors) {
++            if (behavior.getStatus() == Behavior.Status.RUNNING) {
++                runningBehaviours.add(behavior);
+             }
+         }
++        // Quire end
+ 
+         return runningBehaviours;
+     }
+ 
++    // Quire start - the behaviours of availableBehaviorsByPriority flattened in its iteration order (priority, then
++    // activity, then insertion); rebuilt only when behaviours are added or removed
++    private BehaviorControl<? super E> @org.jspecify.annotations.Nullable [] quireFlatBehaviors;
++    private Activity[] quireFlatActivities;
++    private boolean[] quireFlatGroupStart; // first behaviour of a (priority, activity) group
++
++    @SuppressWarnings("unchecked")
++    private BehaviorControl<? super E>[] quire$flatBehaviors() {
++        BehaviorControl<? super E>[] flat = this.quireFlatBehaviors;
++        if (flat != null) {
++            return flat;
++        }
++        final List<BehaviorControl<? super E>> behaviors = new java.util.ArrayList<>();
++        final List<Activity> activities = new java.util.ArrayList<>();
++        final it.unimi.dsi.fastutil.booleans.BooleanArrayList groupStart = new it.unimi.dsi.fastutil.booleans.BooleanArrayList();
++        for (Map<Activity, Set<BehaviorControl<? super E>>> behavioursByActivities : this.availableBehaviorsByPriority.values()) {
++            for (Entry<Activity, Set<BehaviorControl<? super E>>> behavioursForActivity : behavioursByActivities.entrySet()) {
++                boolean first = true;
++                for (BehaviorControl<? super E> behavior : behavioursForActivity.getValue()) {
++                    behaviors.add(behavior);
++                    activities.add(behavioursForActivity.getKey());
++                    groupStart.add(first);
++                    first = false;
++                }
++            }
++        }
++        flat = behaviors.toArray(new BehaviorControl[0]);
++        this.quireFlatActivities = activities.toArray(new Activity[0]);
++        this.quireFlatGroupStart = groupStart.toBooleanArray();
++        this.quireFlatBehaviors = flat;
++        return flat;
++    }
++    // Quire end
++
+     public void useDefaultActivity() {
+         this.setActiveActivity(this.defaultActivity);
+     }
+@@ -408,12 +441,14 @@ public class Brain<E extends LivingEntity> {
+                 .computeIfAbsent(pair.getFirst(), key -> Maps.newHashMap())
+                 .computeIfAbsent(activity, key -> Sets.newLinkedHashSet())
+                 .add(behavior);
++            this.quireFlatBehaviors = null; // Quire - flat view rebuilt on next use
+         }
+     }
+ 
+     @VisibleForTesting
+     public void removeAllBehaviors() {
+         this.availableBehaviorsByPriority.clear();
++        this.quireFlatBehaviors = null; // Quire - flat view rebuilt on next use
+     }
+ 
+     public boolean isActive(final Activity activity) {
+@@ -448,18 +483,23 @@ public class Brain<E extends LivingEntity> {
+     private void startEachNonRunningBehavior(final ServerLevel level, final E body) {
+         long time = level.getGameTime();
+ 
+-        for (Map<Activity, Set<BehaviorControl<? super E>>> behavioursByActivities : this.availableBehaviorsByPriority.values()) {
+-            for (Entry<Activity, Set<BehaviorControl<? super E>>> behavioursForActivity : behavioursByActivities.entrySet()) {
+-                Activity activity = behavioursForActivity.getKey();
+-                if (this.quire$isActive(activity)) { // Quire - mask
+-                    for (BehaviorControl<? super E> behavior : behavioursForActivity.getValue()) {
+-                        if (behavior.getStatus() == Behavior.Status.STOPPED) {
+-                            behavior.tryStart(level, body, time);
+-                        }
+-                    }
++        // Quire start - flat view; the activity is tested once per group, as the nested loops did
++        final BehaviorControl<? super E>[] behaviors = this.quire$flatBehaviors();
++        final Activity[] activities = this.quireFlatActivities;
++        final boolean[] groupStart = this.quireFlatGroupStart;
++        boolean groupActive = false;
++        for (int i = 0; i < behaviors.length; ++i) {
++            if (groupStart[i]) {
++                groupActive = this.quire$isActive(activities[i]);
++            }
++            if (groupActive) {
++                final BehaviorControl<? super E> behavior = behaviors[i];
++                if (behavior.getStatus() == Behavior.Status.STOPPED) {
++                    behavior.tryStart(level, body, time);
+                 }
+             }
+         }
++        // Quire end
+     }
+ 
+     private void tickEachRunningBehavior(final ServerLevel level, final E body) {
