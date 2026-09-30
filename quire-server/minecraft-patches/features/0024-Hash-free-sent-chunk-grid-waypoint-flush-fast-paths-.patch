@@ -1,0 +1,763 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 20:31:43 +0800
+Subject: [PATCH] Hash-free sent-chunk grid, waypoint flush fast paths,
+ one-pass mob caps, timed ticket index, tracker pair trims
+
+
+diff --git a/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java b/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
+index 1f24074a425f10e8f2e411c881f1085ea1e98b8d..9ef245ff39a48f2c9e02b382dad8bcbfb461f0bb 100644
+--- a/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
++++ b/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
+@@ -72,6 +72,11 @@ public final class NearbyPlayers {
+         this.world = world;
+     }
+ 
++    public long quireModCount; // Quire - bumped on every change of any chunk's player lists
++    public int quireMembership; // Quire - bumped when a player is added or removed
++    public java.util.Set<ServerPlayer> quire$players() { // Quire
++        return this.players.keySet();
++    }
+     public int quire$playerCount() { // Quire
+         return this.players.size();
+     }
+@@ -81,6 +86,7 @@ public final class NearbyPlayers {
+         if (this.players.putIfAbsent(player, newTrackers) != null) {
+             throw new IllegalStateException("Already have player " + player);
+         }
++        ++this.quireMembership; // Quire
+ 
+         final ChunkPos chunk = player.chunkPosition();
+ 
+@@ -98,6 +104,7 @@ public final class NearbyPlayers {
+         if (players == null) {
+             return; // May be called during teleportation before the player is actually placed
+         }
++        ++this.quireMembership; // Quire
+ 
+         for (final TrackedPlayer tracker : players) {
+             tracker.remove();
+@@ -187,6 +194,7 @@ public final class NearbyPlayers {
+ 
+         public void addPlayer(final ServerPlayer player, final NearbyMapType type) {
+             ++this.updateCount;
++            ++this.nearbyPlayers.quireModCount; // Quire
+ 
+             final int idx = type.ordinal();
+             final ReferenceList<ServerPlayer> list = this.players[idx];
+@@ -205,6 +213,7 @@ public final class NearbyPlayers {
+ 
+         public void removePlayer(final ServerPlayer player, final NearbyMapType type) {
+             ++this.updateCount;
++            ++this.nearbyPlayers.quireModCount; // Quire
+ 
+             final int idx = type.ordinal();
+             final ReferenceList<ServerPlayer> list = this.players[idx];
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index c4aa01cd283d871557b9a45e53d846f3babf99a5..6d6732cd353906afd351c08addce75e6dc7d8eec 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -283,7 +283,7 @@ public final class RegionizedPlayerChunkLoader {
+             return false;
+         }
+ 
+-        return loader.sentChunks.contains(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++        return loader.quire$isSent(CoordinateUtils.getChunkKey(chunkX, chunkZ)); // Quire - bit grid
+     }
+ 
+     public boolean isChunkSentBorderOnly(final ServerPlayer player, final int chunkX, final int chunkZ) {
+@@ -433,6 +433,21 @@ public final class RegionizedPlayerChunkLoader {
+         }
+         // Quire end - view ring release
+         private final LongOpenHashSet sentChunks = new LongOpenHashSet();
++        // Quire start - bit grid mirror of sentChunks for hash-free membership tests
++        private final dev.quire.util.ChunkBitGrid quireSentGrid = new dev.quire.util.ChunkBitGrid();
++
++        public boolean quire$isSent(final long chunkKey) {
++            return this.quireSentGrid.contains(this.sentChunks, chunkKey);
++        }
++
++        private boolean quire$removeSent(final long chunkKey) {
++            if (this.sentChunks.remove(chunkKey)) {
++                this.quireSentGrid.removed(chunkKey);
++                return true;
++            }
++            return false;
++        }
++        // Quire end
+ 
+         private static final byte CHUNK_TICKET_STAGE_NONE           = 0;
+         private static final byte CHUNK_TICKET_STAGE_LOADING        = 1;
+@@ -521,6 +536,7 @@ public final class RegionizedPlayerChunkLoader {
+ 
+         private void sendChunk(final int chunkX, final int chunkZ) {
+             if (this.sentChunks.add(CoordinateUtils.getChunkKey(chunkX, chunkZ))) {
++                this.quireSentGrid.added(this.sentChunks, CoordinateUtils.getChunkKey(chunkX, chunkZ)); // Quire - bit grid
+                 ((ChunkSystemChunkHolder)((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().chunkHolderManager
+                         .getChunkHolder(chunkX, chunkZ).vanillaChunkHolder).moonrise$addReceivedChunk(this.player);
+ 
+@@ -537,7 +553,7 @@ public final class RegionizedPlayerChunkLoader {
+         }
+ 
+         private void sendUnloadChunk(final int chunkX, final int chunkZ) {
+-            if (!this.sentChunks.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ))) {
++            if (!this.quire$removeSent(CoordinateUtils.getChunkKey(chunkX, chunkZ))) { // Quire - bit grid
+                 return;
+             }
+             this.sendUnloadChunkRaw(chunkX, chunkZ);
+@@ -1113,7 +1129,7 @@ public final class RegionizedPlayerChunkLoader {
+                 // the dist <= view check
+                 final boolean sendChunk = (squareDistance <= (sendViewDistance + 1))
+                     && wantChunkLoaded(currentChunkX, currentChunkZ, chunkX, chunkZ, sendViewDistance);
+-                final boolean sentChunk = sendChunk ? this.sentChunks.contains(chunk) : this.sentChunks.remove(chunk);
++                final boolean sentChunk = sendChunk ? this.sentChunks.contains(chunk) : this.quire$removeSent(chunk); // Quire - bit grid
+ 
+                 if (!sendChunk && sentChunk) {
+                     // have sent the chunk, but don't want it anymore
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/util/stream/TicketSet.java b/ca/spottedleaf/moonrise/patches/chunk_system/util/stream/TicketSet.java
+index d8db8894324276eb3ec58b4883c5635b44c57847..3ffd7a25a12e554e7228dcffaf504a791c1afe91 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/util/stream/TicketSet.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/util/stream/TicketSet.java
+@@ -15,6 +15,32 @@ public final class TicketSet extends AbstractSet<Ticket> {
+ 
+     private Ticket[] tickets;
+     private int size;
++    // Quire start - timed ticket index: the tickets with a timeout, in set order, so expiry does not visit the
++    // (often hundreds of per-player) tickets without one. A ticket's timeout presence never changes while in the set.
++    private static final Ticket[] NO_TICKETS = new Ticket[0];
++    private Ticket[] timed = NO_TICKETS;
++    private int timedSize;
++
++    private static boolean isTimed(final Ticket ticket) {
++        return ((ChunkSystemTicket<?>)(Object)ticket).moonrise$getRemoveDelay() != Long.MIN_VALUE; // ChunkHolderManager.NO_TIMEOUT_MARKER
++    }
++
++    private void timedAdd(final Ticket ticket) {
++        final int index = ~binarySearch(this.timed, 0, this.timedSize, ticket);
++        if (this.timedSize == this.timed.length) {
++            this.timed = Arrays.copyOf(this.timed, Math.max(4, this.timedSize * 2));
++        }
++        System.arraycopy(this.timed, index, this.timed, index + 1, this.timedSize - index);
++        this.timed[index] = ticket;
++        ++this.timedSize;
++    }
++
++    private void timedRemove(final Ticket ticket) {
++        final int index = binarySearch(this.timed, 0, this.timedSize, ticket);
++        System.arraycopy(this.timed, index + 1, this.timed, index, --this.timedSize - index);
++        this.timed[this.timedSize] = null;
++    }
++    // Quire end - timed ticket index
+ 
+     public TicketSet(final int initialCapacity) {
+         this.tickets = new Ticket[initialCapacity];
+@@ -83,9 +109,11 @@ public final class TicketSet extends AbstractSet<Ticket> {
+ 
+         ++this.size;
+         this.tickets[index] = ticket;
++        if (isTimed(ticket)) this.timedAdd(ticket); // Quire - timed ticket index
+     }
+ 
+     private void removeAt(final int index) {
++        if (isTimed(this.tickets[index])) this.timedRemove(this.tickets[index]); // Quire - timed ticket index
+         if (index != --this.size) {
+             System.arraycopy(this.tickets, index + 1, this.tickets, index, this.size - index);
+         }
+@@ -95,7 +123,10 @@ public final class TicketSet extends AbstractSet<Ticket> {
+ 
+     public TicketSet copy() {
+         final int size = this.size;
+-        return new TicketSet(Arrays.copyOf(this.tickets, size), size);
++        final TicketSet copy = new TicketSet(Arrays.copyOf(this.tickets, size), size);
++        copy.timed = Arrays.copyOf(this.timed, this.timedSize); // Quire - timed ticket index
++        copy.timedSize = this.timedSize;
++        return copy;
+     }
+ 
+     public Ticket[] copyBackingArray() {
+@@ -106,6 +137,10 @@ public final class TicketSet extends AbstractSet<Ticket> {
+         final int index = binarySearch(this.tickets, 0, this.size, object);
+         if (index >= 0) {
+             final Ticket old = this.tickets[index];
++            // Quire start - timed ticket index
++            if (isTimed(old)) this.timedRemove(old);
++            if (isTimed(object)) this.timedAdd(object);
++            // Quire end - timed ticket index
+             this.tickets[index] = object;
+             return old;
+         }
+@@ -173,41 +208,22 @@ public final class TicketSet extends AbstractSet<Ticket> {
+     public int expireAndRemoveInto(final Ticket[] array) {
+         Objects.checkFromIndexSize(0, this.size, array.length);
+ 
++        // Quire start - timed ticket index: ticking a ticket without a timeout does nothing, so only the timed ones
++        // are visited; they are in set order, so the removed tickets come out in the same order as a full scan
+         int removed = 0;
+-        int i = 0;
+-        final int len = this.size;
+-        final Ticket[] tickets = this.tickets;
+-
+-        for (;;) {
+-            if (i >= len) {
+-                return removed;
++        final Ticket[] timed = this.timed;
++        final int timedSize = this.timedSize;
++        for (int i = 0; i < timedSize; ++i) {
++            final Ticket ticket = timed[i];
++            if (ChunkHolderManager.tickTicket(ticket)) { // if test throws we're screwed
++                array[removed++] = ticket;
+             }
+-
+-            final Ticket ticket = tickets[i++];
+-            if (!ChunkHolderManager.tickTicket(ticket)) {
+-                continue;
+-            }
+-            array[removed++] = ticket;
+-            break;
+         }
+-
+-        // we only want to write back to backingArray if we really need to
+-
+-        int lastIndex = i - 1; // this is where new elements are shifted to
+-
+-        for (; i < len; ++i) {
+-            final Ticket curr = tickets[i];
+-            if (!ChunkHolderManager.tickTicket(curr)) { // if test throws we're screwed
+-                tickets[lastIndex++] = curr;
+-            } else {
+-                array[removed++] = curr;
+-            }
++        for (int i = 0; i < removed; ++i) {
++            this.removeAt(binarySearch(this.tickets, 0, this.size, array[i]));
+         }
+-
+-        // cleanup end
+-        Arrays.fill(tickets, lastIndex, len, null);
+-        this.size = lastIndex;
+         return removed;
++        // Quire end - timed ticket index
+     }
+ 
+     @Override
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index c36827c24c84abcd6deb423910a3a80d1dbef814..cf81c8d1af25a52fc04148d9c222fb31f9a41305 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -238,12 +238,85 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+     }
+ 
+     // Paper start - Optional per player mob spawns
++    public final int[] quireMobCountEpoch = new int[net.minecraft.world.entity.MobCategory.values().length]; // Quire - per category, bumped on every per-player count change
++
++    // Quire start - per category, the players ordered by count (descending, stable): the first of them that a
++    // chunk's player list contains holds the max over that list, usually found within a few membership tests
++    private static final int QUIRE_MAX_PROBES = 32;
++    private final ServerPlayer[][] quireByCount = new ServerPlayer[net.minecraft.world.entity.MobCategory.values().length][];
++    private final int[][] quireCountOrder = new int[net.minecraft.world.entity.MobCategory.values().length][];
++    private final int[] quireOrderSize = new int[net.minecraft.world.entity.MobCategory.values().length];
++    private final int[] quireGlobalEpoch = new int[net.minecraft.world.entity.MobCategory.values().length];
++    private final boolean[] quireGlobalValid = new boolean[net.minecraft.world.entity.MobCategory.values().length];
++    private int quireGlobalMembership;
++
++    /** Max over the list's players of the category's count, or Integer.MIN_VALUE if not answered here. */
++    public int quire$maxCountIfHolderIn(final ca.spottedleaf.moonrise.common.list.ReferenceList<ServerPlayer> list, final int category) {
++        final ca.spottedleaf.moonrise.common.misc.NearbyPlayers nearby = this.level.moonrise$getNearbyPlayers();
++        if (this.quireGlobalMembership != nearby.quireMembership) {
++            java.util.Arrays.fill(this.quireGlobalValid, false);
++            this.quireGlobalMembership = nearby.quireMembership;
++        }
++        if (!this.quireGlobalValid[category] || this.quireGlobalEpoch[category] != this.quireMobCountEpoch[category]) {
++            this.quire$orderByCount(nearby.quire$players(), category);
++            this.quireGlobalEpoch[category] = this.quireMobCountEpoch[category];
++            this.quireGlobalValid[category] = true;
++        }
++        final ServerPlayer[] order = this.quireByCount[category];
++        final int[] counts = this.quireCountOrder[category];
++        for (int k = 0, n = Math.min(this.quireOrderSize[category], QUIRE_MAX_PROBES); k < n; ++k) {
++            if (list.contains(order[k])) {
++                return counts[k];
++            }
++        }
++        return Integer.MIN_VALUE;
++    }
++
++    private void quire$orderByCount(final java.util.Set<ServerPlayer> players, final int category) {
++        final int n = players.size();
++        ServerPlayer[] order = this.quireByCount[category];
++        if (order == null || order.length < n) {
++            order = this.quireByCount[category] = new ServerPlayer[Math.max(16, n + (n >> 1))];
++            this.quireCountOrder[category] = new int[order.length];
++        }
++        java.util.Arrays.fill(order, null);
++        final int[] counts = this.quireCountOrder[category];
++        final ServerPlayer[] all = players.toArray(new ServerPlayer[0]);
++        final int[] values = new int[all.length];
++        int max = 0;
++        for (int i = 0; i < all.length; ++i) {
++            values[i] = all[i].mobCounts[category] + all[i].mobBackoffCounts[category];
++            max = Math.max(max, values[i]);
++        }
++        if (max > 4096) { // not a small range: comparison sort
++            final Integer[] idx = new Integer[all.length];
++            for (int i = 0; i < idx.length; ++i) idx[i] = i;
++            java.util.Arrays.sort(idx, (a, c) -> Integer.compare(values[c], values[a]));
++            for (int i = 0; i < idx.length; ++i) {
++                order[i] = all[idx[i]];
++                counts[i] = values[idx[i]];
++            }
++        } else { // counting sort, descending
++            final int[] start = new int[max + 2];
++            for (final int v : values) ++start[max - v + 1];
++            for (int v = 1; v < start.length; ++v) start[v] += start[v - 1];
++            for (int i = 0; i < all.length; ++i) {
++                final int at = start[max - values[i]]++;
++                order[at] = all[i];
++                counts[at] = values[i];
++            }
++        }
++        this.quireOrderSize[category] = all.length;
++    }
++    // Quire end
++
+     public void updatePlayerMobTypeMap(final Entity entity) {
+         if (!this.level.paperConfig().entities.spawning.perPlayerMobSpawns) {
+             return;
+         }
+ 
+         final int index = entity.getType().getCategory().ordinal();
++        ++this.quireMobCountEpoch[index]; // Quire
+         final ca.spottedleaf.moonrise.common.list.ReferenceList<ServerPlayer> inRange =
+             this.level.moonrise$getNearbyPlayers().getPlayers(entity.chunkPosition(), ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE);
+         if (inRange == null) {
+@@ -262,6 +335,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             return;
+         }
+         int idx = mobCategory.ordinal();
++        ++this.quireMobCountEpoch[idx]; // Quire
+         final ca.spottedleaf.moonrise.common.list.ReferenceList<ServerPlayer> inRange =
+             this.level.moonrise$getNearbyPlayers().getPlayersByChunk(chunkX, chunkZ, ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE);
+         if (inRange == null) {
+@@ -1106,6 +1180,8 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         boolean[] noOverrides = new boolean[64];
+         ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData[] loaders = new ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData[64];
+         net.minecraft.server.network.ServerGamePacketListenerImpl[] connections = new net.minecraft.server.network.ServerGamePacketListenerImpl[64];
++        int[] connectionHashes = new int[64]; // HashedReferenceSet.hash of connections[i]
++        boolean[] spectator = new boolean[64];
+         int count;
+         final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<long[]> chunkSent = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
+         int words;
+@@ -1122,6 +1198,8 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                 this.noOverrides = new boolean[cap];
+                 this.loaders = new ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData[cap];
+                 this.connections = new net.minecraft.server.network.ServerGamePacketListenerImpl[cap];
++                this.connectionHashes = new int[cap];
++                this.spectator = new boolean[cap];
+             }
+             for (int i = 0; i < n; ++i) {
+                 final ServerPlayer player = players.get(i);
+@@ -1134,6 +1212,8 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                 this.noOverrides[i] = player.getBukkitEntity().quire$hasNoVisibilityOverrides();
+                 this.loaders[i] = ((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer)player).moonrise$getChunkLoader();
+                 this.connections[i] = player.connection;
++                this.connectionHashes[i] = dev.quire.util.HashedReferenceSet.hash(player.connection);
++                this.spectator[i] = player.isSpectator();
+             }
+             for (int i = n; i < this.count; ++i) {
+                 this.players[i] = null;
+@@ -1162,7 +1242,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                 return (bits[this.words + word] & mask) != 0L;
+             }
+             final ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData loader = this.loaders[slot];
+-            final boolean sent = loader != null && loader.getSentChunksRaw().contains(chunkKey);
++            final boolean sent = loader != null && loader.quire$isSent(chunkKey); // Quire - bit grid
+             bits[word] |= mask;
+             if (sent) {
+                 bits[this.words + word] |= mask;
+@@ -1370,7 +1450,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         private final Entity entity;
+         private final int range;
+         private SectionPos lastSectionPos;
+-        public final Set<ServerPlayerConnection> seenBy = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>(); // Paper - Perf: optimise map impl
++        public final Set<ServerPlayerConnection> seenBy = new dev.quire.util.HashedReferenceSet<>(); // Paper - Perf: optimise map impl // Quire - hashed membership
+ 
+         // Paper start - optimise entity tracker
+         private long lastChunkUpdate = -1L;
+@@ -1411,12 +1491,21 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+             if (lastChunkUpdate != currChunkUpdate || lastTrackedChunk != chunk) {
+                 // need to purge any players possible not in the chunk list
+-                for (final ServerPlayerConnection conn : new java.util.ArrayList<>(this.seenBy)) {
+-                    final ServerPlayer player = conn.getPlayer();
+-                    if (!players.contains(player)) {
+-                        this.removePlayer(player);
++                // Quire start - copy seenBy only when something is to be removed (removing does not change the test)
++                ServerPlayerConnection[] toRemove = null;
++                int removeCount = 0;
++                for (final ServerPlayerConnection conn : this.seenBy) {
++                    if (!players.contains(conn.getPlayer())) {
++                        if (toRemove == null) {
++                            toRemove = new ServerPlayerConnection[this.seenBy.size()];
++                        }
++                        toRemove[removeCount++] = conn;
+                     }
+                 }
++                for (int i = 0; i < removeCount; ++i) {
++                    this.removePlayer(toRemove[i].getPlayer());
++                }
++                // Quire end
+             }
+         }
+ 
+@@ -1520,6 +1609,17 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         // Quire start - tracker snapshot: same decision as updatePlayer, evaluated from the snapshot; any change of
+         // tracking state (start or stop tracking) is delegated to updatePlayer, which re-evaluates from live state
++        private static final ClassValue<Boolean> QUIRE_BASE_BROADCAST = new ClassValue<>() {
++            @Override
++            protected Boolean computeValue(final Class<?> type) {
++                try {
++                    return type.getMethod("broadcastToPlayer", ServerPlayer.class).getDeclaringClass() == Entity.class;
++                } catch (final NoSuchMethodException e) {
++                    return false;
++                }
++            }
++        };
++
+         private void quire$updatePlayersFast(final QuireTrackerSnapshot snapshot, final ServerPlayer[] playersRaw, final int len) {
+             final Entity entity = this.entity;
+             final double ex = entity.getX();
+@@ -1532,6 +1632,18 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             final int chunkZ = entity.chunkPosition().z();
+             final long chunkKey = ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkX, chunkZ);
+             long[] chunkBits = null;
++            // broadcastToPlayer without calling it per player: Entity's is true; ServerPlayer's depends on the
++            // receiver only through isSpectator (snapshot) and otherwise on this entity (hoisted)
++            final int broadcastMode; // 0: always true, 1: ServerPlayer rule, -1: call it
++            boolean spectatorCase = false, otherCase = true;
++            if (entity.getClass() == ServerPlayer.class) {
++                broadcastMode = 1;
++                final ServerPlayer self = (ServerPlayer) entity;
++                spectatorCase = self.getCamera() == self;
++                otherCase = !self.isSpectator();
++            } else {
++                broadcastMode = QUIRE_BASE_BROADCAST.get(entity.getClass()) ? 0 : -1;
++            }
+             for (int i = 0; i < len; ++i) {
+                 final ServerPlayer player = playersRaw[i];
+                 if (player == entity) {
+@@ -1554,12 +1666,13 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                     if (chunkBits == null) {
+                         chunkBits = snapshot.chunkBits(chunkKey);
+                     }
+-                    visible = entity.broadcastToPlayer(player) && snapshot.isChunkSent(chunkBits, s, chunkKey);
++                    visible = (broadcastMode == 0 || (broadcastMode == 1 ? (snapshot.spectator[s] ? spectatorCase : otherCase) : entity.broadcastToPlayer(player)))
++                        && snapshot.isChunkSent(chunkBits, s, chunkKey);
+                 }
+                 if (visible) {
+                     visible = snapshot.noOverrides[s] ? entity.visibleByDefault : player.getBukkitEntity().quire$canSee(entity);
+                 }
+-                final boolean seen = this.seenBy.contains(snapshot.connections[s]);
++                final boolean seen = ((dev.quire.util.HashedReferenceSet<ServerPlayerConnection>) this.seenBy).containsHashed(snapshot.connections[s], snapshot.connectionHashes[s]); // Quire - precomputed hash
+                 if (visible != seen) {
+                     this.updatePlayer(player);
+                 }
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index be87e8d4d4797241f2e9b541b49310da502c81e9..2dc1784c2590e99e08d8e762622f08f82bc55471 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -613,6 +613,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         NaturalSpawner.SpawnState spawnCookie;
+         if ((this.spawnFriendlies || this.spawnEnemies) && this.level.paperConfig().entities.spawning.perPlayerMobSpawns) { // don't count mobs when animals and monsters are disabled
+             // re-set mob counts
++            for (int j = 0; j < this.chunkMap.quireMobCountEpoch.length; ++j) ++this.chunkMap.quireMobCountEpoch[j]; // Quire - counts change
+             for (ServerPlayer player : this.level.players()) {
+                 // Paper start - per player mob spawning backoff
+                 for (int j = 0; j < ServerPlayer.MOBCATEGORY_TOTAL_ENUMS; j++) {
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 609d80fd53d1f50bf75229929122949e7e82efbf..e45a9f3f80a9d7e24e21836769f1c627b9294bd4 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -214,7 +214,8 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+     public int quireWaypointSlot = -1; // Quire - waypoint flush snapshot slot (ServerWaypointManager)
+     public int quireTrackSlot = -1; // Quire - entity tracker snapshot slot (ChunkMap)
+     // Quire start - waypoint skip bookkeeping (ServerWaypointManager)
+-    public int quireWpNonBlockIn, quireWpNonBlockOut; // connections that are not block connections, as receiver / as source
++    public int quireWpNonBlockIn, quireWpNonBlockOut;
++    public int quireWpUpdatedEpoch; // waypoint flush in which this player's waypoint was evaluated // connections that are not block connections, as receiver / as source
+     public net.minecraft.core.@org.jspecify.annotations.Nullable BlockPos quireWpLastBlock; // block position at the last full evaluation as a source
+     // Quire end
+     private static final Logger LOGGER = LogUtils.getLogger();
+diff --git a/net/minecraft/server/waypoints/ServerWaypointManager.java b/net/minecraft/server/waypoints/ServerWaypointManager.java
+index 5c5af83fc92d7e16cb49b41cd8c7db129e7a1efa..40ce8e81a23eb0622798277e2616c01e468d067d 100644
+--- a/net/minecraft/server/waypoints/ServerWaypointManager.java
++++ b/net/minecraft/server/waypoints/ServerWaypointManager.java
+@@ -283,12 +283,19 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+ 
+     /** Non-zero while a flush runs: attribute values read during it are cached per entity (see WaypointTransmitter). */
+     public static int quireFlushEpoch;
++    private ServerPlayer[] quireDeferredPlayers = new ServerPlayer[16]; // Quire - updateWaypoint
++    private WaypointTransmitter.Connection[] quireDeferredConnections = new WaypointTransmitter.Connection[16];
++    private int quireStampedThisFlush; // distinct tracked waypoints evaluated in the current flush
++    private int quireWaypointsAtFlush, quireUntracks, quireUntracksAtFlush; // the tracked set did not change during the flush
+     private static int quireNextEpoch;
+ 
+     public synchronized void quire$flushDirty() {
+         if (this.quireDirtyWaypoints.isEmpty() && this.quireDirtyPlayers.isEmpty()) {
+             return;
+         }
++        this.quireStampedThisFlush = 0;
++        this.quireWaypointsAtFlush = this.waypoints.size();
++        this.quireUntracksAtFlush = this.quireUntracks;
+         quireNextEpoch = quireNextEpoch == Integer.MAX_VALUE ? 1 : quireNextEpoch + 1;
+         quireFlushEpoch = quireNextEpoch;
+         this.quire$takeSnapshot(); // Quire - flush snapshot
+@@ -306,7 +313,14 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+                 updatedWaypoints = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>(dirty.length * 2));
+                 for (final WaypointTransmitter waypoint : dirty) {
+                     if (this.waypoints.contains(waypoint)) {
+-                        updatedWaypoints.add(waypoint);
++                        if (waypoint instanceof ServerPlayer stamped) {
++                            if (stamped.quireWpUpdatedEpoch != quireFlushEpoch) {
++                                stamped.quireWpUpdatedEpoch = quireFlushEpoch; // Quire - O(1) membership instead of the set
++                                this.quireStampedThisFlush++;
++                            }
++                        } else if (updatedWaypoints.add(waypoint)) {
++                            this.quireStampedThisFlush++;
++                        }
+                         // Quire start - waypoint skip: a source whose block did not change since its last full
+                         // evaluation, with only block connections, in a clean flush: no connection of it can change
+                         if (this.quireAllClean && waypoint instanceof ServerPlayer source && source.quireWpNonBlockOut == 0
+@@ -362,17 +376,42 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+             // Quire start - snapshot into arrays instead of ImmutableSet.copyOf; same iteration order
+             final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.get(waypoint);
+             if (column != null) {
+-                final int size = column.size();
+-                final ServerPlayer[] players = new ServerPlayer[size];
+-                final WaypointTransmitter.Connection[] connections = new WaypointTransmitter.Connection[size];
+-                int i = 0;
++                // Quire start - in place: connections that stay are updated during the walk; the rare re-made or
++                // dropped ones (which change the column) run after it, in column order. Each receiver has one
++                // connection per waypoint, so no receiver sees its packets reordered.
++                int deferred = 0;
+                 for (final Map.Entry<ServerPlayer, WaypointTransmitter.Connection> entry : column.entrySet()) {
+-                    players[i] = entry.getKey();
+-                    connections[i++] = entry.getValue();
++                    final ServerPlayer player = entry.getKey();
++                    final WaypointTransmitter.Connection connection = entry.getValue();
++                    if (player == waypoint || !isLocatorBarEnabledFor(player)) {
++                        continue; // updateConnection does nothing
++                    }
++                    final int fast = this.quire$fastIsBroken(player, waypoint, connection);
++                    if (fast >= 0 ? fast == 0 : !connection.isBroken()) {
++                        connection.update();
++                    } else {
++                        if (deferred == this.quireDeferredPlayers.length) {
++                            this.quireDeferredPlayers = java.util.Arrays.copyOf(this.quireDeferredPlayers, deferred * 2);
++                            this.quireDeferredConnections = java.util.Arrays.copyOf(this.quireDeferredConnections, deferred * 2);
++                        }
++                        this.quireDeferredPlayers[deferred] = player;
++                        this.quireDeferredConnections[deferred++] = connection;
++                    }
+                 }
+-                for (i = 0; i < size; ++i) {
+-                    this.updateConnection(players[i], waypoint, connections[i]);
++                for (int i = 0; i < deferred; ++i) {
++                    final ServerPlayer player = this.quireDeferredPlayers[i];
++                    final WaypointTransmitter.Connection connection = this.quireDeferredConnections[i];
++                    this.quireDeferredPlayers[i] = null;
++                    this.quireDeferredConnections[i] = null;
++                    waypoint.makeWaypointConnectionWith(player).ifPresentOrElse(newConnection -> {
++                        newConnection.connect();
++                        this.putConnection(player, waypoint, newConnection);
++                    }, () -> {
++                        connection.disconnect();
++                        this.removeConnection(player, waypoint);
++                    });
+                 }
++                // Quire end
+             }
+ 
+             // Same as the live Sets.difference view: re-checked after the updates above
+@@ -407,7 +446,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+             }
+         }
+         // Quire end - connection index
+-        this.waypoints.remove(waypoint);
++        if (this.waypoints.remove(waypoint)) this.quireUntracks++; // Quire - flush fast path
+     }
+ 
+     public void addPlayer(final ServerPlayer player) {
+@@ -436,18 +475,22 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         // Quire - waypoint skip: in a clean flush a block connection only changes when its source changed block,
+         // and sources that moved were evaluated in the waypoint pass (alreadyUpdated); nothing else to do
+         if (row != null && !(this.quireAllClean && player.quireWpNonBlockIn == 0)) {
++            // Quire - every tracked waypoint was evaluated this flush: nothing left in any row
++            if (!(quireFlushEpoch != 0 && this.quireStampedThisFlush == this.waypoints.size() && this.quireWaypointsAtFlush == this.waypoints.size() && this.quireUntracksAtFlush == this.quireUntracks)) {
+             final int size = row.size();
+             final WaypointTransmitter[] waypoints = new WaypointTransmitter[size];
+             final WaypointTransmitter.Connection[] connections = new WaypointTransmitter.Connection[size];
+-            int i = 0;
++            int n = 0;
+             for (final Map.Entry<WaypointTransmitter, WaypointTransmitter.Connection> entry : row.entrySet()) {
+-                waypoints[i] = entry.getKey();
+-                connections[i++] = entry.getValue();
++                final WaypointTransmitter waypoint = entry.getKey();
++                if (waypoint instanceof ServerPlayer stamped ? quireFlushEpoch != 0 && stamped.quireWpUpdatedEpoch == quireFlushEpoch : alreadyUpdated.contains(waypoint)) continue; // Quire - evaluated this flush
++                waypoints[n] = waypoint;
++                connections[n++] = entry.getValue();
+             }
+-            for (i = 0; i < size; ++i) {
+-                if (alreadyUpdated.contains(waypoints[i])) continue; // Quire - evaluated this flush
++            for (int i = 0; i < n; ++i) {
+                 this.updateConnection(player, waypoints[i], connections[i]);
+             }
++            }
+         }
+ 
+         // Same as the live Sets.difference view: re-checked after the updates above
+diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
+index 06c63a3429d010546c8b9de610cbae7bf6bb6935..512133f03a29042169f5dac14171c31513cf0726 100644
+--- a/net/minecraft/world/level/NaturalSpawner.java
++++ b/net/minecraft/world/level/NaturalSpawner.java
+@@ -150,12 +150,18 @@ public final class NaturalSpawner {
+         return spawningCategories;
+     }
+ 
++    private static final boolean QUIRE_MOBCAP_PASS = !Boolean.getBoolean("quire.mobcapPass.off"); // Quire
++    private static final boolean QUIRE_MOBCAP_VERIFY = Boolean.getBoolean("quire.mobcapPass.verify"); // Quire
++
+     public static void spawnForChunk(
+         final ServerLevel level, final LevelChunk chunk, final NaturalSpawner.SpawnState state, final List<MobCategory> spawningCategories
+     ) {
+         ProfilerFiller profiler = Profiler.get();
+         profiler.push("spawner");
+ 
++        int[] quireMaxCount = null, quireEpochs = null; // Quire - per category max of the per-player counts, one pass over the players
++        long quireNearbyMod = 0L;
++        ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.server.level.ServerPlayer> quireList = null;
+         for (MobCategory mobCategory : spawningCategories) {
+             // Paper start - Optional per player mob spawns
+             final boolean canSpawn;
+@@ -172,13 +178,56 @@ public final class NaturalSpawner {
+                 int minDiff = Integer.MAX_VALUE;
+                 final ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.server.level.ServerPlayer> inRange =
+                     level.moonrise$getNearbyPlayers().getPlayers(chunk.getPos(), ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE);
+-                if (inRange != null) {
++                // Quire start - all categories in one pass; a category is recomputed if its counts or the list changed since
++                final net.minecraft.server.level.ChunkMap quireMap = level.getChunkSource().chunkMap;
++                final int quireCat = mobCategory.ordinal();
++                final int quireGlobal = inRange != null && inRange.size() > 0 && QUIRE_MOBCAP_PASS ? quireMap.quire$maxCountIfHolderIn(inRange, quireCat) : Integer.MIN_VALUE;
++                if (quireGlobal != Integer.MIN_VALUE) {
++                    minDiff = limit - quireGlobal; // the holder of the global max is in range
++                } else if (inRange != null && inRange.size() > 0 && QUIRE_MOBCAP_PASS) {
++                    final long nearbyMod = level.moonrise$getNearbyPlayers().quireModCount;
++                    if (quireMaxCount == null || quireList != inRange || quireNearbyMod != nearbyMod) {
++                        final int categories = quireMap.quireMobCountEpoch.length;
++                        if (quireMaxCount == null) {
++                            quireMaxCount = new int[categories];
++                            quireEpochs = new int[categories];
++                        }
++                        java.util.Arrays.fill(quireMaxCount, Integer.MIN_VALUE);
++                        final net.minecraft.server.level.ServerPlayer[] players = inRange.getRawDataUnchecked();
++                        for (int k = 0, len = inRange.size(); k < len; k++) {
++                            final int[] counts = players[k].mobCounts, backoff = players[k].mobBackoffCounts;
++                            for (int c = 0; c < categories; ++c) {
++                                quireMaxCount[c] = Math.max(quireMaxCount[c], counts[c] + backoff[c]);
++                            }
++                        }
++                        System.arraycopy(quireMap.quireMobCountEpoch, 0, quireEpochs, 0, categories);
++                        quireList = inRange;
++                        quireNearbyMod = nearbyMod;
++                    }
++                    if (quireEpochs[quireCat] == quireMap.quireMobCountEpoch[quireCat]) {
++                        minDiff = limit - quireMaxCount[quireCat]; // = min over the players of (limit - count)
++                    }
++                }
++                if (inRange != null && minDiff == Integer.MAX_VALUE) {
++                // Quire end
+                     final net.minecraft.server.level.ServerPlayer[] backingSet = inRange.getRawDataUnchecked();
+                     for (int k = 0, len = inRange.size(); k < len; k++) {
+                         minDiff = Math.min(limit - level.getChunkSource().chunkMap.getMobCountNear(backingSet[k], mobCategory), minDiff);
++                        if (minDiff <= 0) {
++                            break; // Quire - cannot spawn anyway; the exact value is only used when positive
++                        }
+                     }
+                 }
+ 
++                if (QUIRE_MOBCAP_VERIFY && inRange != null) { // Quire - check against the plain loop
++                    int plain = Integer.MAX_VALUE;
++                    for (int k = 0, len = inRange.size(); k < len; k++) {
++                        plain = Math.min(limit - level.getChunkSource().chunkMap.getMobCountNear(inRange.getRawDataUnchecked()[k], mobCategory), plain);
++                    }
++                    if ((plain > 0 || minDiff > 0) && plain != minDiff) {
++                        throw new IllegalStateException("Quire mob cap mismatch " + mobCategory + ": " + minDiff + " vs " + plain);
++                    }
++                }
+                 maxSpawns = (minDiff == Integer.MAX_VALUE) ? 0 : minDiff;
+                 canSpawn = maxSpawns > 0;
+             } else {
+diff --git a/net/minecraft/world/waypoints/WaypointTransmitter.java b/net/minecraft/world/waypoints/WaypointTransmitter.java
+index 59615d31186e3b1cefe317e659e1b2d0a0662cf9..ef54c06dfdb5faf1cf374109cc7c6a8f1675ec1a 100644
+--- a/net/minecraft/world/waypoints/WaypointTransmitter.java
++++ b/net/minecraft/world/waypoints/WaypointTransmitter.java
+@@ -63,7 +63,7 @@ public interface WaypointTransmitter extends Waypoint {
+     static boolean isChunkVisible(final ChunkPos chunkPos, final ServerPlayer receiver) {
+         // Paper start - rewrite chunk system
+         final ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.PlayerChunkLoaderData playerChunkLoader = ((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer)receiver).moonrise$getChunkLoader();
+-        return playerChunkLoader != null && playerChunkLoader.getSentChunksRaw().contains(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkPos));
++        return playerChunkLoader != null && playerChunkLoader.quire$isSent(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkPos)); // Quire - bit grid
+         // Paper end - rewrite chunk system
+     }
+ 
+@@ -146,18 +146,21 @@ public interface WaypointTransmitter extends Waypoint {
+         private final LivingEntity source;
+         private final Waypoint.Icon icon;
+         private final ServerPlayer receiver;
+-        private BlockPos lastPosition;
++        private int lastX, lastY, lastZ; // Quire - inline BlockPos, read without a pointer chase in the flush
+ 
+         public EntityBlockConnection(final LivingEntity source, final Waypoint.Icon icon, final ServerPlayer receiver) {
+             this.source = source;
+             this.receiver = receiver;
+             this.icon = icon;
+-            this.lastPosition = source.blockPosition();
++            final BlockPos position = source.blockPosition(); // Quire - inline
++            this.lastX = position.getX();
++            this.lastY = position.getY();
++            this.lastZ = position.getZ();
+         }
+ 
+         @Override
+         public void connect() {
+-            this.receiver.connection.send(ClientboundTrackedWaypointPacket.addWaypointPosition(this.source.getUUID(), this.icon, this.lastPosition));
++            this.receiver.connection.send(ClientboundTrackedWaypointPacket.addWaypointPosition(this.source.getUUID(), this.icon, new BlockPos(this.lastX, this.lastY, this.lastZ))); // Quire - inline
+         }
+ 
+         @Override
+@@ -168,15 +171,23 @@ public interface WaypointTransmitter extends Waypoint {
+         @Override
+         public void update() {
+             BlockPos currentPosition = this.source.blockPosition();
+-            if (currentPosition.distManhattan(this.lastPosition) > 0) {
++            if (currentPosition.getX() != this.lastX || currentPosition.getY() != this.lastY || currentPosition.getZ() != this.lastZ) { // Quire - same as distManhattan > 0
+                 this.receiver.connection.send(ClientboundTrackedWaypointPacket.updateWaypointPosition(this.source.getUUID(), this.icon, currentPosition));
+-                this.lastPosition = currentPosition;
++                this.lastX = currentPosition.getX();
++                this.lastY = currentPosition.getY();
++                this.lastZ = currentPosition.getZ();
+             }
+         }
+ 
+         @Override
+         public int distanceManhattan() {
+-            return this.lastPosition.distManhattan(this.source.blockPosition());
++            // Quire start - inline; same float sum as Vec3i.distManhattan
++            final BlockPos current = this.source.blockPosition();
++            final float xd = Math.abs(current.getX() - this.lastX);
++            final float yd = Math.abs(current.getY() - this.lastY);
++            final float zd = Math.abs(current.getZ() - this.lastZ);
++            return (int) (xd + yd + zd);
++            // Quire end - inline
+         }
+ 
+         @Override

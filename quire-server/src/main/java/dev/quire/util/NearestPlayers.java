@@ -60,12 +60,12 @@ public final class NearestPlayers {
                 final ServerPlayer[] raw = list.getRawDataUnchecked();
                 for (int i = 0, len = list.size(); i < len; ++i) {
                     final ServerPlayer player = raw[i];
-                    if (predicate == null || predicate.test(player)) {
-                        final double dist = player.distanceToSqr(x, y, z);
-                        if ((range < 0.0 || dist < range * range) && (best == -1.0 || dist < best || (dist == best && before(players, player, result)))) {
-                            best = dist;
-                            result = player;
-                        }
+                    // distance first: the predicate (pure) only runs for a player that would become the result
+                    final double dist = player.distanceToSqr(x, y, z);
+                    if ((range < 0.0 || dist < range * range) && (best == -1.0 || dist < best || (dist == best && before(players, player, result)))
+                        && (predicate == null || predicate.test(player))) {
+                        best = dist;
+                        result = player;
                     }
                 }
             }
@@ -104,12 +104,11 @@ public final class NearestPlayers {
             final ServerPlayer[] raw = list.getRawDataUnchecked();
             for (int i = 0, len = list.size(); i < len; ++i) {
                 final ServerPlayer player = raw[i];
-                if (conditions.test(level, source, player)) {
-                    final double dist = player.distanceToSqr(x, y, z);
-                    if (best == -1.0 || dist < best || (dist == best && before(players, player, result))) {
-                        best = dist;
-                        result = player;
-                    }
+                // distance first: the conditions (pure; may raycast) only run for a player that would become the result
+                final double dist = player.distanceToSqr(x, y, z);
+                if ((best == -1.0 || dist < best || (dist == best && before(players, player, result))) && conditions.test(level, source, player)) {
+                    best = dist;
+                    result = player;
                 }
             }
             return result;
