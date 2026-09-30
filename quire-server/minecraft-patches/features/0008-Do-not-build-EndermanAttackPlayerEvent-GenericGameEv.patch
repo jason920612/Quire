@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 22:07:14 +0800
+Subject: [PATCH] Do not build EndermanAttackPlayerEvent / GenericGameEvent
+ when nothing listens
+
+Measured: EndermanAttackPlayerEvent was built ~975 times per tick and GenericGameEvent ~104 times per tick in a 50 player world, with no listeners.
+
+diff --git a/net/minecraft/world/entity/monster/Enderman.java b/net/minecraft/world/entity/monster/Enderman.java
+index 24085db3c0ab92a67e1857c9c03be6c6507d78c9..b17c8ae27c56e4cc8d4368683e2a79ee16723d29 100644
+--- a/net/minecraft/world/entity/monster/Enderman.java
++++ b/net/minecraft/world/entity/monster/Enderman.java
+@@ -225,6 +225,7 @@ public class Enderman extends Monster implements NeutralMob {
+     private boolean isBeingStaredBy(final Player player) {
+         // Paper start - EndermanAttackPlayerEvent
+         final boolean shouldAttack = this.isBeingStaredBy0(player);
++        if (com.destroystokyo.paper.event.entity.EndermanAttackPlayerEvent.getHandlerList().getRegisteredListeners().length == 0) return shouldAttack; // Quire - no listeners: same result without building the event
+         final com.destroystokyo.paper.event.entity.EndermanAttackPlayerEvent event = new com.destroystokyo.paper.event.entity.EndermanAttackPlayerEvent((org.bukkit.entity.Enderman) getBukkitEntity(), (org.bukkit.entity.Player) player.getBukkitEntity());
+         event.setCancelled(!shouldAttack);
+         return event.callEvent();
+diff --git a/net/minecraft/world/level/gameevent/GameEventDispatcher.java b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+index f8c4b24e603abb85c804cccec2c34c47f2670aba..c4e0cb1bf632b313905ddd96638af88907fafb20 100644
+--- a/net/minecraft/world/level/gameevent/GameEventDispatcher.java
++++ b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+@@ -23,6 +23,7 @@ public class GameEventDispatcher {
+         int radius = gameEvent.value().notificationRadius();
+         BlockPos center = BlockPos.containing(position);
+         // CraftBukkit start
++        if (org.bukkit.event.world.GenericGameEvent.getHandlerList().getRegisteredListeners().length > 0) { // Quire - only build the event when something listens
+         org.bukkit.event.world.GenericGameEvent apiEvent = new org.bukkit.event.world.GenericGameEvent(
+             org.bukkit.craftbukkit.CraftGameEvent.minecraftHolderToBukkit(gameEvent), org.bukkit.craftbukkit.util.CraftLocation.toBukkit(center, this.level),
+             (context.sourceEntity() == null) ? null : context.sourceEntity().getBukkitEntity(), radius, !org.bukkit.Bukkit.isPrimaryThread());
+@@ -30,6 +31,7 @@ public class GameEventDispatcher {
+             return;
+         }
+         radius = apiEvent.getRadius();
++        } // Quire
+         // CraftBukkit end
+         int sectionMinX = SectionPos.blockToSectionCoord(center.getX() - radius);
+         int sectionMinY = SectionPos.blockToSectionCoord(center.getY() - radius);

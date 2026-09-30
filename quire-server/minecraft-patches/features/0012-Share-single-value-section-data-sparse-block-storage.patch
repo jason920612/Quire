@@ -1,0 +1,712 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 09:09:20 +0800
+Subject: [PATCH] Share single-value section data; sparse block storage and
+ light (-Dquire.compressSections=sparse)
+
+Containers holding the same single value share one immutable Data. Block
+section storage and idle light nibbles can be held in a random-access
+two-level sparse encoding; writes inflate, a background encoder
+re-encodes cold sections and the main thread installs a result only if
+the storage is unchanged. Light is frozen by tasks holding the light
+write radius.
+
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+index 240416aba0ad4649e1db401aff2565f972f5ca11..25dc95879b6e593ddae8bffc6800667c02d84bce 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+@@ -20,10 +20,11 @@ public final class SWMRNibbleArray {
+      * Initialised nibble - Has light data.
+      */
+ 
+-    private static final int INIT_STATE_NULL   = 0; // null
+-    private static final int INIT_STATE_UNINIT = 1; // uninitialised
+-    private static final int INIT_STATE_INIT   = 2; // initialised
+-    private static final int INIT_STATE_HIDDEN = 3; // initialised, but conversion to Vanilla data should be treated as if NULL
++    // Quire - states are bytes: with ~700k nibble objects loaded, int states cost an extra 8 bytes per object
++    private static final byte INIT_STATE_NULL   = 0; // null
++    private static final byte INIT_STATE_UNINIT = 1; // uninitialised
++    private static final byte INIT_STATE_INIT   = 2; // initialised
++    private static final byte INIT_STATE_HIDDEN = 3; // initialised, but conversion to Vanilla data should be treated as if NULL
+ 
+     public static final int ARRAY_SIZE = 16 * 16 * 16 / (8/4); // blocks / bytes per block
+     // this allows us to maintain only 1 byte array when we're not updating
+@@ -39,9 +40,153 @@ public final class SWMRNibbleArray {
+     }
+ 
+     private static void freeBytes(final byte[] bytes) {
++        if (bytes == SHARED_ZERO || bytes == SHARED_FULL) return; // Quire - shared read-only arrays never enter the pool
+         WORKING_BYTES_POOL.get().addFirst(bytes);
+     }
+ 
++    // Quire start - share uniform nibble data
++    // Over half of all initialised sky light sections are entirely 15 (open sky) or 0 (deep underground).
++    // They point to one read-only array each; every write path copies before writing (copy-on-write
++    // via swapUpdatingAndMarkDirty/allocateBytes), and updateVisible never copies into a shared array.
++    private static final byte[] SHARED_ZERO = new byte[ARRAY_SIZE];
++    private static final byte[] SHARED_FULL = new byte[ARRAY_SIZE];
++    static {
++        Arrays.fill(SHARED_FULL, (byte)-1);
++    }
++
++    private static boolean isShared(final byte[] bytes) {
++        return bytes == SHARED_ZERO || bytes == SHARED_FULL;
++    }
++
++    private static boolean isAllFull(final byte[] data) {
++        final int len = data.length / Long.BYTES;
++        for (int i = 0; i < len; ++i) {
++            if (-1L != (long)LONG_VIEW.get(data, i << 3)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /** The shared array equal to data, or data itself. */
++    private static byte[] dedupe(final byte[] data) {
++        if (data == null || isShared(data) || data.length != ARRAY_SIZE) {
++            return data;
++        }
++        if (isAllZero(data)) {
++            return SHARED_ZERO;
++        }
++        if (isAllFull(data)) {
++            return SHARED_FULL;
++        }
++        return data;
++    }
++    // Quire end - share uniform nibble data
++
++    // Quire start - frozen light: idle initialised nibbles are held in a sparse encoding (a fraction of 2 KiB).
++    // Invariant: frozen != null => not dirty, state INIT/HIDDEN, storageVisible == storageUpdating == null.
++    // Freezing is an updating operation (it must run where the light engine cannot run concurrently for this
++    // chunk); every updating operation that writes thaws first, reads decode from the sparse form.
++    public static final boolean FREEZE = !"off".equalsIgnoreCase(System.getProperty("quire.freezeLight", "on"));
++    private static final int FREEZE_MAX_BYTES = ARRAY_SIZE * 6 / 10;
++
++    private volatile dev.quire.memory.Sparse4096 frozen;
++    /** Wall clock ({@link dev.quire.memory.LightFreezer#clock()}) of the last published update, for the idle test of the freezer. */
++    public int quireLastUpdate = dev.quire.memory.LightFreezer.clock() - (1 << 20); // never updated: long idle
++
++    private static dev.quire.memory.Sparse4096 encode(final byte[] bytes) {
++        final int[] v = new int[4096];
++        for (int i = 0; i < 4096; ++i) {
++            v[i] = (bytes[i >>> 1] >>> ((i & 1) << 2)) & 0xF;
++        }
++        return dev.quire.memory.Sparse4096.encode(v, 4, FREEZE_MAX_BYTES);
++    }
++
++    private static byte[] decode(final dev.quire.memory.Sparse4096 sparse) {
++        final byte[] bytes = new byte[ARRAY_SIZE];
++        for (int i = 0; i < ARRAY_SIZE; ++i) {
++            bytes[i] = (byte)(sparse.get(i << 1) | (sparse.get((i << 1) | 1) << 4));
++        }
++        return bytes;
++    }
++
++    private boolean quireFreezeFailed; // since the last published update
++
++    public boolean isFrozen() {
++        return this.frozen != null;
++    }
++
++    /** Debug: why this nibble is not freezable (0 = freezable). */
++    public int quire$notFreezableReason() {
++        final byte[] data = this.storageVisible;
++        if (this.frozen != null) return 1;
++        if (this.quireFreezeFailed) return 2;
++        if (data == null) return 3;
++        if (isShared(data)) return 4;
++        if (this.stateVisible != INIT_STATE_INIT && this.stateVisible != INIT_STATE_HIDDEN) return 5;
++        if (this.isDirty()) return 6;
++        return 0;
++    }
++
++    /** Racy hint for the freezer. */
++    public boolean quire$freezable() {
++        final byte[] data = this.storageVisible;
++        return FREEZE && !this.quireFreezeFailed && this.frozen == null && data != null && !isShared(data)
++            && (this.stateVisible == INIT_STATE_INIT || this.stateVisible == INIT_STATE_HIDDEN);
++    }
++
++    // operation type: updating
++    public boolean quire$freeze() {
++        if (!FREEZE || this.frozen != null || this.isDirty()) {
++            return false;
++        }
++        synchronized (this) {
++            final byte[] data = this.storageVisible;
++            if ((this.stateVisible != INIT_STATE_INIT && this.stateVisible != INIT_STATE_HIDDEN) || data == null || isShared(data)
++                || this.storageUpdating != data) {
++                return false;
++            }
++            final dev.quire.memory.Sparse4096 sparse = encode(data);
++            if (sparse == null) {
++                this.quireFreezeFailed = true;
++                return false;
++            }
++            if (dev.quire.memory.SectionCompression.VERIFY && !Arrays.equals(decode(sparse), data)) {
++                throw new IllegalStateException("Sparse light encoding mismatch");
++            }
++            // publish the frozen form before dropping the array: visible readers check the array first
++            this.frozen = sparse;
++            this.storageVisible = null;
++            this.storageUpdating = null;
++            return true;
++        }
++    }
++
++    // operation type: updating
++    private void thaw() {
++        synchronized (this) {
++            final dev.quire.memory.Sparse4096 sparse = this.frozen;
++            if (sparse == null) {
++                return;
++            }
++            final byte[] data = decode(sparse);
++            this.storageUpdating = data;
++            this.storageVisible = data; // publish the array before dropping the frozen form
++            this.frozen = null;
++        }
++    }
++
++    /** Visible data as an array (decoded copy when frozen); caller holds the lock. */
++    private byte[] visibleData() {
++        final byte[] data = this.storageVisible;
++        if (data != null) {
++            return data;
++        }
++        final dev.quire.memory.Sparse4096 sparse = this.frozen;
++        return sparse == null ? null : decode(sparse);
++    }
++    // Quire end - frozen light
++
+     public static SWMRNibbleArray fromVanilla(final DataLayer nibble) {
+         if (nibble == null) {
+             return new SWMRNibbleArray(null, true);
+@@ -52,8 +197,8 @@ public final class SWMRNibbleArray {
+         }
+     }
+ 
+-    private int stateUpdating;
+-    private volatile int stateVisible;
++    private byte stateUpdating; // Quire - byte
++    private volatile byte stateVisible; // Quire - byte
+ 
+     private byte[] storageUpdating;
+     private boolean updatingDirty; // only returns whether storageUpdating is dirty
+@@ -72,7 +217,7 @@ public final class SWMRNibbleArray {
+             throw new IllegalArgumentException("Data of wrong length: " + bytes.length);
+         }
+         this.stateVisible = this.stateUpdating = bytes == null ? (isNullNibble ? INIT_STATE_NULL : INIT_STATE_UNINIT) : INIT_STATE_INIT;
+-        this.storageUpdating = this.storageVisible = bytes;
++        this.storageUpdating = this.storageVisible = dedupe(bytes); // Quire - share uniform nibble data
+     }
+ 
+     public SWMRNibbleArray(final byte[] bytes, final int state) {
+@@ -82,8 +227,9 @@ public final class SWMRNibbleArray {
+         if (bytes == null && (state == INIT_STATE_INIT || state == INIT_STATE_HIDDEN)) {
+             throw new IllegalArgumentException("Data cannot be null and have state be initialised");
+         }
+-        this.stateUpdating = this.stateVisible = state;
+-        this.storageUpdating = this.storageVisible = bytes;
++        this.stateUpdating = this.stateVisible = (byte)state; // Quire - byte states
++        this.storageUpdating = this.storageVisible = dedupe(bytes); // Quire - share uniform nibble data
++        this.quire$freeze(); // Quire - frozen light: loaded light starts frozen (not yet published, so this is safe)
+     }
+ 
+     @Override
+@@ -109,7 +255,7 @@ public final class SWMRNibbleArray {
+         }
+         stringBuilder.append("\nData:\n");
+ 
+-        final byte[] data = this.storageVisible;
++        final byte[] data = this.visibleData(); // Quire - frozen light
+         if (data != null) {
+             for (int i = 0; i < 4096; ++i) {
+                 // Copied from NibbleArray#toString
+@@ -138,7 +284,8 @@ public final class SWMRNibbleArray {
+     public SaveState getSaveState(final boolean copy) {
+         synchronized (this) {
+             final int state = this.stateVisible;
+-            final byte[] data = this.storageVisible;
++            final boolean decoded = this.storageVisible == null && this.frozen != null; // Quire - frozen light
++            final byte[] data = this.visibleData(); // Quire - frozen light
+             if (state == INIT_STATE_NULL) {
+                 return null;
+             }
+@@ -149,7 +296,7 @@ public final class SWMRNibbleArray {
+             if (zero) {
+                 return state == INIT_STATE_INIT ? new SaveState(null, INIT_STATE_UNINIT) : null;
+             } else {
+-                return new SaveState(copy ? data.clone() : data, state);
++                return new SaveState(copy && !decoded ? data.clone() : data, state); // Quire - frozen light: a decoded array is already a copy
+             }
+         }
+     }
+@@ -173,13 +320,15 @@ public final class SWMRNibbleArray {
+         if (other.stateUpdating == INIT_STATE_NULL) {
+             throw new IllegalArgumentException();
+         }
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
++        final dev.quire.memory.Sparse4096 otherFrozen = other.frozen; // Quire - frozen light: read the source without thawing it
+ 
+-        if (other.storageUpdating == null) {
++        if (other.storageUpdating == null && otherFrozen == null) { // Quire - frozen light
+             this.setUninitialised();
+             return;
+         }
+ 
+-        final byte[] src = other.storageUpdating;
++        final byte[] src = other.storageUpdating != null ? other.storageUpdating : decode(otherFrozen); // Quire - frozen light
+         final byte[] into;
+ 
+         if (!this.updatingDirty) {
+@@ -205,6 +354,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     public void setFull() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         if (this.stateUpdating != INIT_STATE_HIDDEN) {
+             this.stateUpdating = INIT_STATE_INIT;
+         }
+@@ -214,6 +364,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     public void setZero() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         if (this.stateUpdating != INIT_STATE_HIDDEN) {
+             this.stateUpdating = INIT_STATE_INIT;
+         }
+@@ -223,6 +374,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     public void setNonNull() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         if (this.stateUpdating == INIT_STATE_HIDDEN) {
+             this.stateUpdating = INIT_STATE_INIT;
+             return;
+@@ -235,6 +387,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     public void setNull() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         this.stateUpdating = INIT_STATE_NULL;
+         if (this.updatingDirty && this.storageUpdating != null) {
+             freeBytes(this.storageUpdating);
+@@ -245,6 +398,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     public void setUninitialised() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         this.stateUpdating = INIT_STATE_UNINIT;
+         if (this.storageUpdating != null && this.updatingDirty) {
+             freeBytes(this.storageUpdating);
+@@ -255,6 +409,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     public void setHidden() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         if (this.stateUpdating == INIT_STATE_HIDDEN) {
+             return;
+         }
+@@ -312,6 +467,7 @@ public final class SWMRNibbleArray {
+ 
+     // operation type: updating
+     private void swapUpdatingAndMarkDirty() {
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
+         if (this.updatingDirty) {
+             return;
+         }
+@@ -334,13 +490,17 @@ public final class SWMRNibbleArray {
+         if (!this.isDirty()) {
+             return false;
+         }
++        if (this.frozen != null) this.thaw(); // Quire - frozen light
++        this.quireLastUpdate = dev.quire.memory.LightFreezer.clock(); // Quire - frozen light
++        this.quireFreezeFailed = false; // Quire - frozen light
+ 
+         synchronized (this) {
+             if (this.stateUpdating == INIT_STATE_NULL || this.stateUpdating == INIT_STATE_UNINIT) {
+                 this.storageVisible = null;
+             } else {
+-                if (this.storageVisible == null) {
+-                    this.storageVisible = this.storageUpdating.clone();
++                // Quire start - share uniform nibble data: never copy into a shared array
++                if (this.storageVisible == null || isShared(this.storageVisible)) {
++                    this.storageVisible = isShared(this.storageUpdating) ? this.storageUpdating : this.storageUpdating.clone();
+                 } else {
+                     if (this.storageUpdating != this.storageVisible) {
+                         System.arraycopy(this.storageUpdating, 0, this.storageVisible, 0, ARRAY_SIZE);
+@@ -350,6 +510,12 @@ public final class SWMRNibbleArray {
+                 if (this.storageUpdating != this.storageVisible) {
+                     freeBytes(this.storageUpdating);
+                 }
++                final byte[] shared = dedupe(this.storageVisible);
++                if (shared != this.storageVisible) {
++                    // the old array is left to the GC, not the pool: readers may still hold it
++                    this.storageVisible = shared;
++                }
++                // Quire end - share uniform nibble data
+                 this.storageUpdating = this.storageVisible;
+             }
+             this.updatingDirty = false;
+@@ -369,7 +535,7 @@ public final class SWMRNibbleArray {
+                 case INIT_STATE_UNINIT:
+                     return new DataLayer();
+                 case INIT_STATE_INIT:
+-                    return new DataLayer(this.storageVisible.clone());
++                    return new DataLayer(this.storageVisible != null ? this.storageVisible.clone() : this.visibleData()); // Quire - frozen light
+                 default:
+                     throw new IllegalStateException();
+             }
+@@ -388,7 +554,10 @@ public final class SWMRNibbleArray {
+         // indices range from 0 -> 4096
+         final byte[] bytes = this.storageUpdating;
+         if (bytes == null) {
+-            return 0;
++            // Quire start - frozen light
++            final dev.quire.memory.Sparse4096 sparse = this.frozen;
++            return sparse == null ? 0 : sparse.get(index);
++            // Quire end - frozen light
+         }
+         final byte value = bytes[index >>> 1];
+ 
+@@ -407,7 +576,15 @@ public final class SWMRNibbleArray {
+         // indices range from 0 -> 4096
+         final byte[] visibleBytes = this.storageVisible;
+         if (visibleBytes == null) {
+-            return 0;
++            // Quire start - frozen light: array first, then the frozen form (freeze publishes the frozen form
++            // before dropping the array, thaw publishes the array before dropping the frozen form)
++            final dev.quire.memory.Sparse4096 sparse = this.frozen;
++            if (sparse != null) {
++                return sparse.get(index);
++            }
++            final byte[] again = this.storageVisible;
++            return again == null ? 0 : ((again[index >>> 1] >>> ((index & 1) << 2)) & 0xF);
++            // Quire end - frozen light
+         }
+         final byte value = visibleBytes[index >>> 1];
+ 
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java
+index 1b74af157a70867cf3a62ac8faf7e015dd2b7bac..797a90063243745063572030fac9ac6aa0033d2b 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java
+@@ -296,7 +296,7 @@ public abstract class StarLightEngine {
+         final LevelChunkSection section = this.sectionCache[(worldX >> 4) + 5 * (worldZ >> 4) + (5 * 5) * (worldY >> 4) + this.chunkSectionIndexOffset];
+ 
+         if (section != null) {
+-            return section.hasOnlyAir() ? AIR_BLOCK_STATE : section.getBlockState(worldX & 15, worldY & 15, worldZ & 15);
++            return section.hasOnlyAir() ? AIR_BLOCK_STATE : section.getStates().quire$peek(worldX & 15, worldY & 15, worldZ & 15); // Quire - lighting never inflates compressed sections
+         }
+ 
+         return AIR_BLOCK_STATE;
+@@ -306,7 +306,7 @@ public abstract class StarLightEngine {
+         final LevelChunkSection section = this.sectionCache[sectionIndex];
+ 
+         if (section != null) {
+-            return section.hasOnlyAir() ? AIR_BLOCK_STATE : section.getStates().get(localIndex);
++            return section.hasOnlyAir() ? AIR_BLOCK_STATE : section.getStates().quire$peek(localIndex); // Quire - lighting never inflates compressed sections
+         }
+ 
+         return AIR_BLOCK_STATE;
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 9a918eda97cb79fda9ddb072a04cb9bbf19f3f83..d8db6b14b0ecb3e0bba93b8d703aeab65013768a 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1842,6 +1842,8 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         for (ServerLevel level : this.getAllLevels()) {
+             level.getWaypointManager().quire$flushDirty();
+         }
++        dev.quire.memory.SectionCompactor.tick(this); // Quire - recompress cold block sections
++        dev.quire.memory.LightFreezer.tick(this); // Quire - freeze idle light
+         // Quire end
+ 
+         profiler.popPush("send chunks");
+diff --git a/net/minecraft/world/level/chunk/PalettedContainer.java b/net/minecraft/world/level/chunk/PalettedContainer.java
+index bf5b2e8745f50287ed5628d09a5288ce19cd30da..84d3fd8f9cf0b96dd516828944ce2e1e55b65e89 100644
+--- a/net/minecraft/world/level/chunk/PalettedContainer.java
++++ b/net/minecraft/world/level/chunk/PalettedContainer.java
+@@ -22,9 +22,132 @@ import net.minecraft.util.ThreadingDetector;
+ import net.minecraft.util.ZeroBitStorage;
+ import org.jspecify.annotations.Nullable;
+ 
+-public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainerRO<T> {
++public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainerRO<T>, dev.quire.memory.FrozenBitStorage.Owner { // Quire - section compression
+     private static final int MIN_PALETTE_BITS = 0;
+     public volatile PalettedContainer.Data<T> data; // Paper - optimise collisions - public
++
++    // Quire start - section compression
++    /** Wall clock ({@link dev.quire.memory.LightFreezer#clock()}, ~1 s units) until which this container counts as hot (recently inflated) and is not recompressed. */
++    public int quireHotUntil;
++    private byte quireInflations;
++    /** Set when encoding failed (does not shrink enough); cleared when the storage is replaced. In-place writes do not clear it. */
++    private boolean quireEncodeFailed;
++    private boolean quireEncoding; // a snapshot is being encoded off-thread
++
++    @Override
++    public synchronized SimpleBitStorage quire$inflate(final dev.quire.memory.FrozenBitStorage compressed) {
++        final SimpleBitStorage live = compressed.inflateForOwner();
++        final PalettedContainer.Data<T> current = this.data;
++        if (current.storage == compressed) {
++            final PalettedContainer.Data<T> inflated = new PalettedContainer.Data<>(current.configuration, live, current.palette);
++            this.updateData(inflated);
++            this.data = inflated;
++            dev.quire.memory.SectionCompression.INFLATED.increment();
++            if (dev.quire.memory.SectionCompression.TRACE) dev.quire.memory.SectionCompression.traceInflate();
++            // back off exponentially for containers that keep getting inflated (deflate 1 min .. ~34 min, sparse 10 s .. ~5 min)
++            final int backoff = (dev.quire.memory.SectionCompression.SPARSE ? 10 : 60) << Math.min(5, this.quireInflations); // sparse re-encoding is cheap
++            if (this.quireInflations < 5) {
++                this.quireInflations++;
++            }
++            this.quireHotUntil = (dev.quire.memory.LightFreezer.clock() + backoff) | 1; // never 0 (0 = never inflated)
++        }
++        return live;
++    }
++
++    /** Read-only access for bulk scanners (lighting): never inflates a compressed container. */
++    public T quire$peek(final int x, final int y, final int z) {
++        return this.quire$peek(this.strategy.getIndex(x, y, z));
++    }
++
++    public T quire$peek(final int index) {
++        final PalettedContainer.Data<T> data = this.data;
++        if (data.storage instanceof dev.quire.memory.FrozenBitStorage compressed) {
++            return this.readPalette(data, compressed.peek(index));
++        }
++        return this.readPalette(data, data.storage.get(index));
++    }
++
++    /** Compresses the storage if it is a plain storage of at least 4 bits and deflates well. */
++    public synchronized boolean quire$compress() {
++        final PalettedContainer.Data<T> current = this.data;
++        if (this.quireEncodeFailed || !(current.storage instanceof SimpleBitStorage storage) || storage.getBits() < 4) {
++            return false;
++        }
++        final dev.quire.memory.FrozenBitStorage frozen;
++        if (dev.quire.memory.SectionCompression.SPARSE) {
++            frozen = dev.quire.memory.SparseBitStorage.encode(this, storage, dev.quire.memory.SectionCompression.SPARSE_MAX_RATIO);
++            if (frozen == null) {
++                dev.quire.memory.SectionCompression.FAILED.increment();
++                this.quireEncodeFailed = true;
++                return false;
++            }
++            if (dev.quire.memory.SectionCompression.VERIFY && !java.util.Arrays.equals(frozen.getRaw(), storage.getRaw())) {
++                throw new IllegalStateException("Sparse section encoding mismatch (bits " + storage.getBits() + ")");
++            }
++            dev.quire.memory.SectionCompression.COMPRESSED.increment();
++            dev.quire.memory.SectionCompression.PACKED_BYTES.add(frozen.packedBytes());
++        } else {
++            final long[] raw = storage.getRaw();
++            final byte[] packed = dev.quire.memory.SectionCompression.deflate(raw);
++            if (packed == null) {
++                this.quireEncodeFailed = true;
++                return false;
++            }
++            frozen = new dev.quire.memory.CompressedBitStorage(this, packed, storage.getBits(), storage.getSize(), raw.length);
++        }
++        final PalettedContainer.Data<T> compressed = new PalettedContainer.Data<>(current.configuration, frozen, current.palette);
++        this.updateData(compressed);
++        this.data = compressed;
++        return true;
++    }
++
++    /** Storage read with explicit fast paths, so the hot block read stays inlined with several storage types around. */
++    private static int quire$read(final BitStorage storage, final int index) {
++        if (storage instanceof SimpleBitStorage simple) {
++            return simple.get(index);
++        }
++        if (storage instanceof ZeroBitStorage) {
++            return 0;
++        }
++        return storage.get(index);
++    }
++
++    /** Snapshot of the plain storage for off-thread encoding, or null if it is not a candidate. */
++    public synchronized long[] quire$snapshotForEncoding() {
++        if (this.quireEncoding || this.quireEncodeFailed || !(this.data.storage instanceof SimpleBitStorage storage) || storage.getBits() < 4) {
++            return null;
++        }
++        this.quireEncoding = true;
++        return storage.getRaw().clone();
++    }
++
++    public synchronized SimpleBitStorage quire$plainStorage() {
++        return this.data.storage instanceof SimpleBitStorage storage ? storage : null;
++    }
++
++    /** Installs an encoding made off-thread from {@code snapshot} if the storage is still {@code expected} with the same contents. */
++    public synchronized boolean quire$installEncoded(final SimpleBitStorage expected, final long[] snapshot, final dev.quire.memory.FrozenBitStorage frozen) {
++        this.quireEncoding = false;
++        final PalettedContainer.Data<T> current = this.data;
++        if (current.storage != expected || !java.util.Arrays.equals(expected.getRaw(), snapshot)) {
++            return false;
++        }
++        if (frozen == null) {
++            dev.quire.memory.SectionCompression.FAILED.increment();
++            this.quireEncodeFailed = true;
++            return false;
++        }
++        if (dev.quire.memory.SectionCompression.VERIFY && !java.util.Arrays.equals(frozen.getRaw(), snapshot)) {
++            throw new IllegalStateException("Sparse section encoding mismatch (bits " + expected.getBits() + ")");
++        }
++        dev.quire.memory.SectionCompression.COMPRESSED.increment();
++        dev.quire.memory.SectionCompression.PACKED_BYTES.add(frozen.packedBytes());
++        final PalettedContainer.Data<T> compressed = new PalettedContainer.Data<>(current.configuration, frozen, current.palette);
++        this.updateData(compressed);
++        this.data = compressed;
++        return true;
++    }
++    // Quire end - section compression
+     private final Strategy<T> strategy;
+     private final T @Nullable [] presetValues; // Paper - Anti-Xray - Add preset values
+     //private final ThreadingDetector threadingDetector = new ThreadingDetector("PalettedContainer"); // Paper - unused
+@@ -133,12 +256,13 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+             }
+         }
+         // Paper end - Anti-Xray
++        this.data = this.quire$share(this.data); // Quire
+     }
+ 
+     private PalettedContainer(final PalettedContainer<T> source, final T @Nullable [] presetValues) { // Paper - Anti-Xray - Add preset values
+         this.presetValues = presetValues; // Paper - Anti-Xray - Add preset values
+         this.strategy = source.strategy;
+-        this.data = source.data.copy();
++        this.data = this.quire$share(source.data.copy()); // Quire - share single-value data
+         this.updateData(this.data); // Paper - optimise palette reads
+     }
+ 
+@@ -153,12 +277,36 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         this.strategy = strategy;
+         this.data = this.createOrReuseData(null, 0);
+         this.data.palette.idFor(initialValue, this);
++        this.data = this.quire$share(this.data); // Quire - share single-value data
+         this.updateData(this.data); // Paper - optimise palette reads
+     }
+ 
++    // Quire start - single-value data is immutable once its value is set (vanilla's SingleValuePalette.copy() already
++    // returns itself), so containers holding the same single value share one Data. Writing a different value resizes
++    // into fresh Data; createOrReuseData never hands shared Data back for in-place reuse.
++    private PalettedContainer.Data<T> quire$share(final PalettedContainer.Data<T> data) {
++        if (data.quire$shared || !(data.palette instanceof SingleValuePalette<T> single) || data.storage.getBits() != 0
++            || !(data.storage instanceof ZeroBitStorage) || data.storage.getSize() != this.strategy.entryCount()) {
++            return data;
++        }
++        final T value = single.quire$value();
++        if (value == null) {
++            return data;
++        }
++        PalettedContainer.Data<T> shared = (PalettedContainer.Data<T>) this.strategy.quire$sharedSingleValueData.get(value);
++        if (shared == null) {
++            this.updateData(data);
++            data.quire$shared = true;
++            final Object raced = this.strategy.quire$sharedSingleValueData.putIfAbsent(value, data);
++            shared = raced == null ? data : (PalettedContainer.Data<T>) raced;
++        }
++        return shared.configuration.equals(data.configuration) ? shared : data;
++    }
++    // Quire end
++
+     private PalettedContainer.Data<T> createOrReuseData(final PalettedContainer.@Nullable Data<T> oldData, final int targetBits) {
+         Configuration dataConfiguration = this.strategy.getConfigurationForBitCount(targetBits);
+-        if (oldData != null && dataConfiguration.equals(oldData.configuration())) {
++        if (oldData != null && !oldData.quire$shared && dataConfiguration.equals(oldData.configuration())) { // Quire - never mutate shared data
+             return oldData;
+         }
+ 
+@@ -193,6 +341,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         }
+         // Paper end - Anti-Xray
+         PalettedContainer.Data<T> newData = this.createOrReuseData(oldData, bits);
++        this.quireEncodeFailed = false; // Quire - storage replaced
+         newData.copyFrom(oldData.palette, oldData.storage);
+         this.data = newData;
+         this.updateData(this.data); // Paper - optimise palette reads
+@@ -249,7 +398,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+     public T get(final int index) { // Paper - public
+         // Paper start - optimise palette reads
+         final PalettedContainer.Data<T> data = this.data;
+-        return this.readPalette(data, data.storage.get(index));
++        return this.readPalette(data, quire$read(data.storage, index)); // Quire - monomorphic fast paths
+         // Paper end - optimise palette reads
+     }
+ 
+@@ -265,6 +414,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         this.acquire();
+ 
+         try {
++            if (this.data.storage instanceof dev.quire.memory.FrozenBitStorage compressed) this.quire$inflate(compressed); // Quire - writes into getRaw() below
+             int newBits = buffer.readByte();
+             PalettedContainer.Data<T> newData = this.createOrReuseData(this.data, newBits);
+             newData.palette.read(buffer, this.strategy.globalMap());
+@@ -272,6 +422,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+             this.data = newData;
+             this.updateData(this.data); // Paper - optimise palette reads
+             this.addPresetValues(); // Paper - Anti-Xray - Add preset values (inefficient, but this isn't used by the server)
++            this.data = this.quire$share(this.data); // Quire - share single-value data
+         } finally {
+             this.release();
+         }
+@@ -341,7 +492,13 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+             }
+         }
+ 
+-        return DataResult.success(new PalettedContainer<>(strategy, storedConfiguration, storage, palette, paletteEntries, defaultValue, presetValues)); // Paper - Anti-Xray - Add preset values
++        // Quire start - section compression: block sections start out compressed (they inflate on first access)
++        final PalettedContainer<T> container = new PalettedContainer<>(strategy, storedConfiguration, storage, palette, paletteEntries, defaultValue, presetValues); // Paper - Anti-Xray - Add preset values
++        if (dev.quire.memory.SectionCompression.ENABLED && entryCount == 4096) {
++            container.quire$compress();
++        }
++        return DataResult.success(container);
++        // Quire end - section compression
+     }
+ 
+     // Paper start - optimise PalettedContainer packing
+@@ -520,6 +677,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         private final Palette<T> palette;
+ 
+         private T[] moonrise$palette;
++        boolean quire$shared; // Quire - shared between containers, never mutated
+ 
+         public Data(final Configuration configuration, final BitStorage storage, final Palette<T> palette) {
+             this.configuration = configuration;
+@@ -572,7 +730,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         }
+ 
+         public int getSerializedSize(final IdMap<T> globalMap) {
+-            return 1 + this.palette.getSerializedSize(globalMap) + this.storage.getRaw().length * 8;
++            return 1 + this.palette.getSerializedSize(globalMap) + (this.storage instanceof dev.quire.memory.FrozenBitStorage frozen ? frozen.rawLength() : this.storage.getRaw().length) * 8; // Quire - no decode for the length
+         }
+ 
+         public void write(final FriendlyByteBuf buffer, final IdMap<T> globalMap, final io.papermc.paper.antixray.@Nullable ChunkPacketInfo<T> chunkPacketInfo, final int chunkSectionIndex) { // Paper - Anti-Xray - Add chunk packet info
+diff --git a/net/minecraft/world/level/chunk/SingleValuePalette.java b/net/minecraft/world/level/chunk/SingleValuePalette.java
+index 06a7f795739df3ccb7cae0aa00c88eb8ceea8073..cb882659ab589039856afd2227d44e195a3f45fa 100644
+--- a/net/minecraft/world/level/chunk/SingleValuePalette.java
++++ b/net/minecraft/world/level/chunk/SingleValuePalette.java
+@@ -30,6 +30,12 @@ public class SingleValuePalette<T> implements Palette<T>, ca.spottedleaf.moonris
+         }
+     }
+ 
++    // Quire start
++    public @Nullable T quire$value() {
++        return this.value;
++    }
++    // Quire end
++
+     public static <A> Palette<A> create(final int bits, final List<A> paletteEntries) {
+         return new SingleValuePalette<>(paletteEntries);
+     }
+diff --git a/net/minecraft/world/level/chunk/Strategy.java b/net/minecraft/world/level/chunk/Strategy.java
+index 958be147cd940ac430576ca5b4ada70fa5d051e3..201ea7fc01162a67841d309afb93681a2be8b2ac 100644
+--- a/net/minecraft/world/level/chunk/Strategy.java
++++ b/net/minecraft/world/level/chunk/Strategy.java
+@@ -16,6 +16,7 @@ public abstract class Strategy<T> {
+     private static final Configuration SIX_BITS_HASHMAP = new Configuration.Simple(HASHMAP_PALETTE_FACTORY, 6);
+     private static final Configuration SEVEN_BITS_HASHMAP = new Configuration.Simple(HASHMAP_PALETTE_FACTORY, 7);
+     private static final Configuration EIGHT_BITS_HASHMAP = new Configuration.Simple(HASHMAP_PALETTE_FACTORY, 8);
++    public final java.util.concurrent.ConcurrentHashMap<Object, Object> quire$sharedSingleValueData = new java.util.concurrent.ConcurrentHashMap<>(); // Quire - shared single-value container data
+     private final IdMap<T> globalMap;
+     private final GlobalPalette<T> globalPalette;
+     protected final int globalPaletteBitsInMemory;

@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 23:25:58 +0800
+Subject: [PATCH] Tile-parallel block entities and chunk random ticks; measured
+ per-stage mode choice
+
+Block entities and chunk random ticks (precipitation and random block ticks; spawning stays serial) use the tile scheduler. Each stage per world picks serial or a tile size by measured ns/unit (burst probing). Random tick generators and getBlockRandomPos are per worker; mid-tick chunk tasks never run on workers; synchronous chunk loads from a worker are handed to the main thread.
+
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index 15391be259e265fbfb7ddd48a175aa0b63709c3a..be87e8d4d4797241f2e9b541b49310da502c81e9 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -183,9 +183,8 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         // Quire start - tile-parallel chunk ticks (random ticks, precipitation, lightning); spawning stays serial
+         if (dev.quire.parallel.QuireParallel.ENABLED && !dev.quire.parallel.ShadowStats.ENABLED
+             && net.minecraft.util.profiling.Profiler.get() == net.minecraft.util.profiling.InactiveProfiler.INSTANCE) {
+-            dev.quire.parallel.QuireParallel.tickUnits(world, java.util.Arrays.asList(raw).subList(0, size),
+-                chunk -> chunk.coordinateKey, chunk -> world.tickChunk(chunk, randomTickSpeed),
+-                dev.quire.parallel.QuireParallel.UNIT_TILE_SHIFT);
++            dev.quire.parallel.QuireParallel.tickUnits(world, dev.quire.parallel.QuireParallel.STAGE_CHUNKS, java.util.Arrays.asList(raw).subList(0, size),
++                chunk -> chunk.coordinateKey, chunk -> world.tickChunk(chunk, randomTickSpeed));
+             ((ca.spottedleaf.moonrise.patches.chunk_system.server.ChunkSystemMinecraftServer)this.level.getServer()).moonrise$executeMidTickTasks();
+             return;
+         }
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index d6c409199c795201d779c22413896b8745ad8c82..aa994ae7b8a4212e3b9d05e47e3d26bf860ecc52 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -1526,9 +1526,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+                     quireTickers.add(ticker);
+                 }
+             }
+-            dev.quire.parallel.QuireParallel.tickUnits(serverLevel, quireTickers,
++            dev.quire.parallel.QuireParallel.tickUnits(serverLevel, dev.quire.parallel.QuireParallel.STAGE_BLOCK_ENTITIES, quireTickers,
+                 ticker -> ((long) (ticker.getPos().getZ() >> 4) << 32) | ((ticker.getPos().getX() >> 4) & 0xFFFFFFFFL),
+-                TickingBlockEntity::tick, dev.quire.parallel.QuireParallel.UNIT_TILE_SHIFT);
++                TickingBlockEntity::tick);
+             ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)(Level)(Object)this).moonrise$midTickTasks();
+             this.blockEntityTickers.removeAll(toRemove);
+             this.tickingBlockEntities = false;

@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 09:19:25 +0800
+Subject: [PATCH] Quire changes to Paper sources
+
+Smaller index structures for ShortList and ReferenceList, tile worker
+threads count as tick threads, optional event dispatch statistics.
+
+diff --git a/src/main/java/ca/spottedleaf/moonrise/common/list/ReferenceList.java b/src/main/java/ca/spottedleaf/moonrise/common/list/ReferenceList.java
+index 2e876b918672e8ef3b5197b7e6b1597247fdeaa1..16a20dd52cd5b5d60c8016c6aa0b3bfe1f07e23b 100644
+--- a/src/main/java/ca/spottedleaf/moonrise/common/list/ReferenceList.java
++++ b/src/main/java/ca/spottedleaf/moonrise/common/list/ReferenceList.java
+@@ -9,7 +9,38 @@ public final class ReferenceList<E> implements Iterable<E> {
+ 
+     private static final Object[] EMPTY_LIST = new Object[0];
+ 
+-    private final Reference2IntOpenHashMap<E> referenceToIndex;
++    // Quire start - index map only for larger lists; small lists (most of them) find entries by identity scan
++    private static final int INDEX_THRESHOLD = 16;
++    private Reference2IntOpenHashMap<E> referenceToIndex;
++
++    private static <E> Reference2IntOpenHashMap<E> newIndex(final int expected) {
++        final Reference2IntOpenHashMap<E> map = new Reference2IntOpenHashMap<>(expected, 0.8f);
++        map.defaultReturnValue(Integer.MIN_VALUE);
++        return map;
++    }
++
++    private void buildIndex() {
++        final Reference2IntOpenHashMap<E> map = newIndex(this.count * 2);
++        for (int i = 0; i < this.count; ++i) {
++            map.put(this.references[i], i);
++        }
++        this.referenceToIndex = map;
++    }
++
++    private int indexOf(final E obj) {
++        final Reference2IntOpenHashMap<E> map = this.referenceToIndex;
++        if (map != null) {
++            return map.getInt(obj);
++        }
++        final E[] list = this.references;
++        for (int i = 0, len = this.count; i < len; ++i) {
++            if (list[i] == obj) {
++                return i;
++            }
++        }
++        return Integer.MIN_VALUE;
++    }
++    // Quire end
+     private E[] references;
+     private int count;
+ 
+@@ -18,9 +49,7 @@ public final class ReferenceList<E> implements Iterable<E> {
+     }
+ 
+     public ReferenceList(final E[] referenceArray) {
+-        this.references = referenceArray;
+-        this.referenceToIndex = new Reference2IntOpenHashMap<>(2, 0.8f);
+-        this.referenceToIndex.defaultReturnValue(Integer.MIN_VALUE);
++        this.references = referenceArray; // Quire - index map built lazily
+     }
+ 
+     private ReferenceList(final E[] references, final int count, final Reference2IntOpenHashMap<E> referenceToIndex) {
+@@ -30,7 +59,7 @@ public final class ReferenceList<E> implements Iterable<E> {
+     }
+ 
+     public ReferenceList<E> copy() {
+-        return new ReferenceList<>(this.references.clone(), this.count, this.referenceToIndex.clone());
++        return new ReferenceList<>(this.references.clone(), this.count, this.referenceToIndex == null ? null : this.referenceToIndex.clone()); // Quire
+     }
+ 
+     public int size() {
+@@ -38,19 +67,21 @@ public final class ReferenceList<E> implements Iterable<E> {
+     }
+ 
+     public boolean contains(final E obj) {
+-        return this.referenceToIndex.containsKey(obj);
++        return this.indexOf(obj) != Integer.MIN_VALUE; // Quire
+     }
+ 
+     public boolean remove(final E obj) {
+-        final int index = this.referenceToIndex.removeInt(obj);
++        // Quire start
++        final int index = this.referenceToIndex != null ? this.referenceToIndex.removeInt(obj) : this.indexOf(obj);
+         if (index == Integer.MIN_VALUE) {
+             return false;
+         }
++        // Quire end
+ 
+         // move the object at the end to this index
+         final int endIndex = --this.count;
+         final E end = (E)this.references[endIndex];
+-        if (index != endIndex) {
++        if (index != endIndex && this.referenceToIndex != null) { // Quire
+             // not empty after this call
+             this.referenceToIndex.put(end, index); // update index
+         }
+@@ -62,11 +93,13 @@ public final class ReferenceList<E> implements Iterable<E> {
+ 
+     public boolean add(final E obj) {
+         final int count = this.count;
+-        final int currIndex = this.referenceToIndex.putIfAbsent(obj, count);
++        // Quire start
++        final int currIndex = this.referenceToIndex != null ? this.referenceToIndex.putIfAbsent(obj, count) : this.indexOf(obj);
+ 
+         if (currIndex != Integer.MIN_VALUE) {
+             return false; // already in this list
+         }
++        // Quire end
+ 
+         E[] list = this.references;
+ 
+@@ -78,6 +111,10 @@ public final class ReferenceList<E> implements Iterable<E> {
+         list[count] = obj;
+         this.count = count + 1;
+ 
++        if (this.referenceToIndex == null && count + 1 > INDEX_THRESHOLD) { // Quire
++            this.buildIndex();
++        }
++
+         return true;
+     }
+ 
+@@ -101,7 +138,7 @@ public final class ReferenceList<E> implements Iterable<E> {
+     }
+ 
+     public void clear() {
+-        this.referenceToIndex.clear();
++        this.referenceToIndex = null; // Quire
+         Arrays.fill(this.references, 0, this.count, null);
+         this.count = 0;
+     }
+diff --git a/src/main/java/ca/spottedleaf/moonrise/common/list/ShortList.java b/src/main/java/ca/spottedleaf/moonrise/common/list/ShortList.java
+index c2fe81726ad2cfba2d71f37445d72cc9c4b075f6..e6f497e0a2540c960f76a41b5de5bee594b422fc 100644
+--- a/src/main/java/ca/spottedleaf/moonrise/common/list/ShortList.java
++++ b/src/main/java/ca/spottedleaf/moonrise/common/list/ShortList.java
+@@ -5,10 +5,35 @@ import java.util.Arrays;
+ 
+ public final class ShortList {
+ 
+-    private final Short2ShortOpenHashMap map = new Short2ShortOpenHashMap();
+-    {
+-        this.map.defaultReturnValue(Short.MIN_VALUE);
++    // Quire start - index map only for large lists; small lists (almost all) find entries by scanning
++    private static final int INDEX_THRESHOLD = 1024;
++
++    private Short2ShortOpenHashMap map;
++
++    private void buildMap() {
++        final Short2ShortOpenHashMap map = new Short2ShortOpenHashMap(Math.max(INDEX_THRESHOLD, (int)this.count) * 2);
++        map.defaultReturnValue(Short.MIN_VALUE);
++        final short[] list = this.byIndex;
++        for (int i = 0, len = (int)this.count; i < len; ++i) {
++            map.put(list[i], (short)i);
++        }
++        this.map = map;
++    }
++
++    private int indexOf(final short value) {
++        final Short2ShortOpenHashMap map = this.map;
++        if (map != null) {
++            return map.get(value); // Short.MIN_VALUE (negative) when absent
++        }
++        final short[] list = this.byIndex;
++        for (int i = 0, len = (int)this.count; i < len; ++i) {
++            if (list[i] == value) {
++                return i;
++            }
++        }
++        return -1;
+     }
++    // Quire end - index map only for large lists; small lists (almost all) find entries by scanning
+ 
+     private static final short[] EMPTY_LIST = new short[0];
+ 
+@@ -31,16 +56,22 @@ public final class ShortList {
+         if (byIndex.length < len) {
+             this.byIndex = Arrays.copyOf(byIndex, len);
+         }
+-        this.map.ensureCapacity(len);
++        if (this.map != null) { // Quire - index map only for large lists
++            this.map.ensureCapacity(len);
++        }
+     }
+ 
+     public boolean add(final short value) {
+         final int count = (int)this.count;
+-        final short currIndex = this.map.putIfAbsent(value, (short)count);
+-
+-        if (currIndex != Short.MIN_VALUE) {
++        // Quire start - index map only for large lists
++        if (this.map != null) {
++            if (this.map.putIfAbsent(value, (short)count) != Short.MIN_VALUE) {
++                return false; // already in this list
++            }
++        } else if (this.indexOf(value) >= 0) {
+             return false; // already in this list
+         }
++        // Quire end - index map only for large lists
+ 
+         short[] list = this.byIndex;
+ 
+@@ -52,23 +83,54 @@ public final class ShortList {
+         list[count] = value;
+         this.count = (short)(count + 1);
+ 
++        if (this.map == null && count + 1 > INDEX_THRESHOLD) { // Quire
++            this.buildMap();
++        }
++
+         return true;
+     }
+ 
++    // Quire start - bulk append of values the caller guarantees are distinct and absent from this list
++    public void addAllDistinct(final short[] values, final int length) {
++        if (length <= 0) {
++            return;
++        }
++        final int count = (int)this.count;
++        final int newCount = count + length;
++        if (this.byIndex.length < newCount) {
++            this.byIndex = Arrays.copyOf(this.byIndex, newCount);
++        }
++        System.arraycopy(values, 0, this.byIndex, count, length);
++        this.count = (short)newCount;
++        if (this.map != null) {
++            for (int i = count; i < newCount; ++i) {
++                this.map.put(this.byIndex[i], (short)i);
++            }
++        } else if (newCount > INDEX_THRESHOLD) {
++            this.buildMap();
++        }
++    }
++    // Quire end
++
+     public boolean remove(final short value) {
+-        final short index = this.map.remove(value);
+-        if (index == Short.MIN_VALUE) {
++        // Quire start - index map only for large lists
++        final int index = this.indexOf(value);
++        if (index < 0) {
+             return false;
+         }
++        if (this.map != null) {
++            this.map.remove(value);
++        }
++        // Quire end - index map only for large lists
+ 
+         // move the entry at the end to this index
+         final short endIndex = --this.count;
+         final short end = this.byIndex[endIndex];
+-        if (index != endIndex) {
++        if (index != endIndex && this.map != null) { // Quire
+             // not empty after this call
+-            this.map.put(end, index);
++            this.map.put(end, (short)index);
+         }
+-        this.byIndex[(int)index] = end;
++        this.byIndex[index] = end;
+         this.byIndex[(int)endIndex] = (short)0;
+ 
+         return true;
+@@ -76,6 +138,6 @@ public final class ShortList {
+ 
+     public void clear() {
+         this.count = (short)0;
+-        this.map.clear();
++        this.map = null; // Quire - index map only for large lists
+     }
+ }
+diff --git a/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java b/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java
+index 69cdd304d255d52c9b7dc9b6a33ffdb630b79abe..f8f090f5e13216c3f10896669e7804ccee66508f 100644
+--- a/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java
++++ b/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java
+@@ -127,30 +127,37 @@ public class TickThread extends Thread {
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final BlockPos pos) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(world, pos.getX() >> 4, pos.getZ() >> 4); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final BlockPos pos, final int blockRadius) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(world, (pos.getX() - blockRadius) >> 4, (pos.getZ() - blockRadius) >> 4, (pos.getX() + blockRadius) >> 4, (pos.getZ() + blockRadius) >> 4); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final ChunkPos pos) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(world, pos.x(), pos.z()); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final Vec3 pos) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(world, net.minecraft.util.Mth.floor(pos.x) >> 4, net.minecraft.util.Mth.floor(pos.z) >> 4); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final int chunkX, final int chunkZ) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(world, chunkX, chunkZ); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final AABB aabb) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(world, net.minecraft.util.Mth.floor(aabb.minX) >> 4, net.minecraft.util.Mth.floor(aabb.minZ) >> 4, net.minecraft.util.Mth.floor(aabb.maxX) >> 4, net.minecraft.util.Mth.floor(aabb.maxZ) >> 4); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final double blockX, final double blockZ) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(world, net.minecraft.util.Mth.floor(blockX) >> 4, net.minecraft.util.Mth.floor(blockZ) >> 4); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+@@ -159,14 +166,17 @@ public class TickThread extends Thread {
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final int fromChunkX, final int fromChunkZ, final int toChunkX, final int toChunkZ) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(world, Math.min(fromChunkX, toChunkX), Math.min(fromChunkZ, toChunkZ), Math.max(fromChunkX, toChunkX), Math.max(fromChunkZ, toChunkZ)); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Level world, final int chunkX, final int chunkZ, final int radius) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(world, chunkX - radius, chunkZ - radius, chunkX + radius, chunkZ + radius); // Quire - tile guard
+         return isTickThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Entity entity) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) if (entity != null) dev.quire.parallel.QuireParallel.checkChunk(entity.level(), entity.chunkPosition().x(), entity.chunkPosition().z()); // Quire - tile guard
+         return isTickThread();
+     }
+ }
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+index 8b7a15af1eb2cc0318e26d7199c8e684de63cd72..c7f98c76637e408d18a9d4eea909379d2fab5596 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+@@ -42,6 +42,15 @@ class PaperEventManager {
+ 
+         HandlerList handlers = event.getHandlers();
+         RegisteredListener[] listeners = handlers.getRegisteredListeners();
++        // Quire start - plugin code only ever runs on the main thread, with tile workers quiescent
++        if (dev.quire.parallel.QuireParallel.ENABLED && listeners.length > 0 && dev.quire.parallel.QuireParallel.onWorker()) {
++            dev.quire.parallel.QuireParallel.runOnMain(() -> this.callEvent(event));
++            return;
++        }
++        // Quire end
++        final long quireStart = dev.quire.stats.EventStats.ENABLED ? System.nanoTime() : 0L; // Quire - event stats
++        if (dev.quire.parallel.ShadowStats.ENABLED && listeners.length > 0) dev.quire.parallel.ShadowStats.event(event); // Quire - shadow stats
++        try { // Quire - event stats
+ 
+         for (RegisteredListener registration : listeners) {
+             if (!registration.getPlugin().isEnabled()) {
+@@ -71,6 +80,13 @@ class PaperEventManager {
+                 }
+             }
+         }
++        // Quire start - event stats
++        } finally {
++            if (dev.quire.stats.EventStats.ENABLED) {
++                dev.quire.stats.EventStats.record(event, listeners, System.nanoTime() - quireStart);
++            }
++        }
++        // Quire end - event stats
+     }
+ 
+     public void registerEvents(@NotNull Listener listener, @NotNull Plugin plugin) {

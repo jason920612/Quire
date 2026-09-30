@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 18:31:51 +0800
+Subject: [PATCH] Cache hot block tag membership and evaluate isPushable once
+ per push query
+
+Block#quire$hasHotTag caches CLIMBABLE / CAN_GLIDE_THROUGH per block, invalidated whenever holder tags are rebound. pushableBy() evaluated the pusher's isPushable() (tag lookups included) for every candidate and each candidate's twice; the UUID hash for collidable exemptions is skipped when there are none.
+
+diff --git a/net/minecraft/core/Holder.java b/net/minecraft/core/Holder.java
+index 72582907823feecd39ba89e47e818d5a6b8e9051..d1f78bdd945efe0eef21e32445bd0e6baf12b8b6 100644
+--- a/net/minecraft/core/Holder.java
++++ b/net/minecraft/core/Holder.java
+@@ -253,6 +253,7 @@ public sealed interface Holder<T> permits Holder.Direct, Holder.Reference {
+ 
+         void bindTags(final Collection<TagKey<T>> tags) {
+             this.tags = it.unimi.dsi.fastutil.objects.ReferenceSets.unmodifiable(new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>(tags)); // Paper - use reference set because TagKey are interned
++            dev.quire.util.TagGeneration.bump(); // Quire - invalidate cached tag membership
+         }
+ 
+         public void bindComponents(final DataComponentMap components) {
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 662d615b15cfc079d7d66da1b904123609e5ce25..a7b9e79f4b3ec5907726b1aeabfb5c0ade5e7e14 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -2637,6 +2637,12 @@ public abstract class Entity
+     }
+     // CraftBukkit end
+ 
++    // Quire start - canCollideWithBukkit without its isPushable() part, for callers that already checked it
++    public boolean quire$canCollideWithBukkitGivenPushable(final Entity entity) {
++        return true;
++    }
++    // Quire end
++
+     public void awardKillScore(final Entity victim, final DamageSource killingBlow) {
+         if (victim instanceof ServerPlayer serverPlayer) {
+             CriteriaTriggers.ENTITY_KILLED_PLAYER.trigger(serverPlayer, this, killingBlow);
+diff --git a/net/minecraft/world/entity/EntitySelector.java b/net/minecraft/world/entity/EntitySelector.java
+index a3c13e421768f5e1a703b5b1167fa1c912b6f126..829c92234a1e97f1df1f941a6bded41ef1c87ef5 100644
+--- a/net/minecraft/world/entity/EntitySelector.java
++++ b/net/minecraft/world/entity/EntitySelector.java
+@@ -48,10 +48,22 @@ public final class EntitySelector {
+         return ownCollisionRule == Team.CollisionRule.NEVER
+             ? Predicates.alwaysFalse()
+             : NO_SPECTATORS.and(
+-                input -> {
+-                    if (!input.isPushable() || !input.canCollideWithBukkit(entity) || !entity.canCollideWithBukkit(input)) { // CraftBukkit - collidable API // Paper - Climbing should not bypass cramming gamerule
++                new Predicate<Entity>() { // Quire - evaluate the pusher's isPushable() once per query instead of once per candidate
++                private int pusherPushable; // 0 = not computed yet, 1 = false, 2 = true
++
++                @Override
++                public boolean test(final Entity input) {
++                    // Quire start - same checks as canCollideWithBukkit on both sides, without recomputing isPushable()
++                    if (!input.isPushable() || !input.quire$canCollideWithBukkitGivenPushable(entity)) {
++                        return false;
++                    }
++                    if (this.pusherPushable == 0) {
++                        this.pusherPushable = entity.isPushable() ? 2 : 1;
++                    }
++                    if (this.pusherPushable != 2 || !entity.quire$canCollideWithBukkitGivenPushable(input)) { // CraftBukkit - collidable API // Paper - Climbing should not bypass cramming gamerule
+                         return false;
+                     }
++                    // Quire end - same checks as canCollideWithBukkit on both sides, without recomputing isPushable()
+ 
+                     if (!entity.level().isClientSide() || input instanceof Player player && player.isLocalPlayer()) {
+                         Team theirTeam = input.getTeam();
+@@ -70,6 +82,7 @@ public final class EntitySelector {
+                         return false;
+                     }
+                 }
++                } // Quire
+             );
+     }
+ 
+diff --git a/net/minecraft/world/entity/LivingEntity.java b/net/minecraft/world/entity/LivingEntity.java
+index f332edbc4dad82cbdc02a58aa9ec21faf1f2db89..7efb135291f3d04641139ca41f32920a48d85bd7 100644
+--- a/net/minecraft/world/entity/LivingEntity.java
++++ b/net/minecraft/world/entity/LivingEntity.java
+@@ -2167,9 +2167,9 @@ public abstract class LivingEntity extends Entity implements Attackable, Waypoin
+         } else {
+             BlockPos ladderCheckPos = this.blockPosition();
+             BlockState state = this.getInBlockState();
+-            if (this.isFallFlying() && state.is(BlockTags.CAN_GLIDE_THROUGH)) {
++            if (this.isFallFlying() && state.getBlock().quire$hasHotTag(net.minecraft.world.level.block.Block.QUIRE_TAG_CAN_GLIDE_THROUGH)) { // Quire - cached tag membership
+                 return false;
+-            } else if (state.is(BlockTags.CLIMBABLE)) {
++            } else if (state.getBlock().quire$hasHotTag(net.minecraft.world.level.block.Block.QUIRE_TAG_CLIMBABLE)) { // Quire - cached tag membership
+                 this.lastClimbablePos = Optional.of(ladderCheckPos);
+                 return true;
+             } else if (state.getBlock() instanceof TrapDoorBlock && this.trapdoorUsableAsLadder(ladderCheckPos, state)) {
+@@ -4090,6 +4090,13 @@ public abstract class LivingEntity extends Entity implements Attackable, Waypoin
+     }
+     // CraftBukkit end
+ 
++    // Quire start - skip isPushable() (already checked) and hashing the UUID when there are no exemptions
++    @Override
++    public boolean quire$canCollideWithBukkitGivenPushable(final Entity entity) {
++        return this.collides != (!this.collidableExemptions.isEmpty() && this.collidableExemptions.contains(entity.getUUID()));
++    }
++    // Quire end
++
+     @Override
+     public float getYHeadRot() {
+         return this.yHeadRot;
+diff --git a/net/minecraft/world/level/block/Block.java b/net/minecraft/world/level/block/Block.java
+index 1b89d481168347f8edd078a8ac190b38a4390a6f..1cb29696236b4a663de4facb386b685a315d02d0 100644
+--- a/net/minecraft/world/level/block/Block.java
++++ b/net/minecraft/world/level/block/Block.java
+@@ -679,6 +679,25 @@ public class Block extends BlockBehaviour implements ItemLike {
+     }
+ 
+     @Deprecated
++    // Quire start - cached membership of tags checked on hot entity paths
++    public static final int QUIRE_TAG_CLIMBABLE = 1;
++    public static final int QUIRE_TAG_CAN_GLIDE_THROUGH = 2;
++    // (tag generation << 2) | flag bits; -1 = not computed. A single int so racing readers never see a torn value.
++    private int quireHotTags = -1;
++
++    public final boolean quire$hasHotTag(final int flag) {
++        final int generation = dev.quire.util.TagGeneration.get();
++        int cached = this.quireHotTags;
++        if (cached == -1 || (cached >>> 2) != generation) {
++            cached = (generation << 2)
++                | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.CLIMBABLE) ? QUIRE_TAG_CLIMBABLE : 0)
++                | (this.builtInRegistryHolder.is(net.minecraft.tags.BlockTags.CAN_GLIDE_THROUGH) ? QUIRE_TAG_CAN_GLIDE_THROUGH : 0);
++            this.quireHotTags = cached;
++        }
++        return (cached & flag) != 0;
++    }
++    // Quire end - cached membership of tags checked on hot entity paths
++
+     public Holder.Reference<Block> builtInRegistryHolder() {
+         return this.builtInRegistryHolder;
+     }

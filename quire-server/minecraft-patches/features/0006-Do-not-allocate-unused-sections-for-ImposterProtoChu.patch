@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 20:08:56 +0800
+Subject: [PATCH] Do not allocate unused sections for ImposterProtoChunk
+
+Every loaded full chunk has an imposter proto chunk that delegates to it, yet each imposter allocated its own full set of empty sections (about 40% of all sections in memory). They are now created on first use by the two methods that read them, with the same factory, so behaviour is unchanged.
+
+diff --git a/net/minecraft/world/level/chunk/ChunkAccess.java b/net/minecraft/world/level/chunk/ChunkAccess.java
+index d0d435f53683bae1a4c333aed18cc36c9797a188..b02538aeca016eb6678de29c7567286a656fa93d 100644
+--- a/net/minecraft/world/level/chunk/ChunkAccess.java
++++ b/net/minecraft/world/level/chunk/ChunkAccess.java
+@@ -159,7 +159,9 @@ public abstract class ChunkAccess implements LightChunk, StructureAccess, BiomeR
+             }
+         }
+ 
++        if (!((Object)this instanceof ImposterProtoChunk)) { // Quire - imposters delegate to the wrapped chunk; their own sections are created lazily
+         this.replaceMissingSections(containerFactory, this.sections); // Paper - Anti-Xray - make it a non-static method
++        } // Quire
+         // Paper start - rewrite chunk system
+         if (!((Object)this instanceof ImposterProtoChunk)) {
+             this.starlight$setBlockNibbles(ca.spottedleaf.moonrise.patches.starlight.light.StarLightEngine.getFilledEmptyLight(levelHeightAccessor));
+@@ -172,7 +174,7 @@ public abstract class ChunkAccess implements LightChunk, StructureAccess, BiomeR
+         // Paper end - get block chunk optimisation
+     }
+ 
+-    private void replaceMissingSections(final PalettedContainerFactory containerFactory, final LevelChunkSection[] sections) { // Paper - Anti-Xray - make it a non-static method
++    protected void replaceMissingSections(final PalettedContainerFactory containerFactory, final LevelChunkSection[] sections) { // Paper - Anti-Xray - make it a non-static method // Quire - protected for ImposterProtoChunk
+         for (int i = 0; i < sections.length; i++) {
+             if (sections[i] == null) {
+                 sections[i] = new LevelChunkSection(containerFactory, this.levelHeightAccessor instanceof net.minecraft.world.level.Level ? (net.minecraft.world.level.Level) this.levelHeightAccessor : null, this.chunkPos, this.levelHeightAccessor.getSectionYFromSectionIndex(i)); // Paper - Anti-Xray - Add parameters
+diff --git a/net/minecraft/world/level/chunk/ImposterProtoChunk.java b/net/minecraft/world/level/chunk/ImposterProtoChunk.java
+index 3b346da37c2c9e0bb64898cc48746f270899a728..03f2c0b300cdd404ba81fca766b595ad980e7d3f 100644
+--- a/net/minecraft/world/level/chunk/ImposterProtoChunk.java
++++ b/net/minecraft/world/level/chunk/ImposterProtoChunk.java
+@@ -37,6 +37,29 @@ public class ImposterProtoChunk extends ProtoChunk implements ca.spottedleaf.moo
+         this.allowWrites = allowWrites;
+     }
+ 
++    // Quire start - lazily create this imposter's own (unused by delegation) sections
++    // Vanilla gives every imposter a full set of empty sections, one imposter per loaded chunk, yet only
++    // collectBiomesInPalette/setNoiseBiome ever read them. Build them on first use with the same factory.
++    private void quire$ensureOwnSections() {
++        final LevelChunkSection[] own = this.sections;
++        synchronized (own) { // rare path (worldgen next to loaded chunks); always lock for safe publication
++            this.replaceMissingSections(this.wrapped.getLevel().palettedContainerFactory(), own);
++        }
++    }
++
++    @Override
++    public void collectBiomesInPalette(final java.util.Set<Holder<Biome>> output) {
++        this.quire$ensureOwnSections();
++        super.collectBiomesInPalette(output);
++    }
++
++    @Override
++    public void setNoiseBiome(final int quartX, final int quartY, final int quartZ, final Holder<Biome> biome) {
++        this.quire$ensureOwnSections();
++        super.setNoiseBiome(quartX, quartY, quartZ, biome);
++    }
++    // Quire end - lazily create this imposter's own (unused by delegation) sections
++
+     // Paper start - rewrite chunk system
+     @Override
+     public ca.spottedleaf.moonrise.patches.starlight.light.SWMRNibbleArray[] starlight$getBlockNibbles() {

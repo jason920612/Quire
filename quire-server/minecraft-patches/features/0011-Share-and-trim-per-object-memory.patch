@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Wed, 30 Sep 2026 09:09:20 +0800
+Subject: [PATCH] Share and trim per-object memory
+
+Intern collision face shapes, allocate random-tick lists lazily, release
+per-search pathfinding state, shrink drained tick queues, share advancement
+trigger keys and structure template positions, and start small chunk
+holder and entity slice maps.
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+index 5b7ed8e5067683143c99473a126e17baa531903c..943d71dc2c72d65047e69fde39640c5903041a72 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+@@ -76,8 +76,8 @@ public final class ChunkEntitySlices {
+ 
+         this.allEntities = new EntityCollectionBySection(this);
+         this.hardCollidingEntities = new EntityCollectionBySection(this);
+-        this.entitiesByClass = new Reference2ObjectOpenHashMap<>();
+-        this.entitiesByType = new Reference2ObjectOpenHashMap<>();
++        this.entitiesByClass = new Reference2ObjectOpenHashMap<>(2); // Quire - small initial capacity
++        this.entitiesByType = new Reference2ObjectOpenHashMap<>(2); // Quire - small initial capacity
+ 
+         this.status = status;
+         this.chunkData = chunkData;
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+index 7a0006f9b56d1e43b06f9f7452e1b5bb0ec53e72..2ba534e68ca0c8d45ae6995d2e1f77d87726ee80 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+@@ -508,7 +508,7 @@ public final class NewChunkHolder {
+     /**
+      * map of ChunkHolder -> Required Status for this chunk
+      */
+-    private final Reference2ObjectLinkedOpenHashMap<NewChunkHolder, ChunkStatus> neighboursWaitingForUs = new Reference2ObjectLinkedOpenHashMap<>();
++    private final Reference2ObjectLinkedOpenHashMap<NewChunkHolder, ChunkStatus> neighboursWaitingForUs = new Reference2ObjectLinkedOpenHashMap<>(2); // Quire - small initial capacity: almost always empty
+ 
+     public void addGenerationBlockingNeighbour(final NewChunkHolder neighbour) {
+         this.neighboursBlockingGenTask.add(neighbour);
+@@ -1326,7 +1326,7 @@ public final class NewChunkHolder {
+         return this.requestedGenStatus;
+     }
+ 
+-    private final Reference2ObjectOpenHashMap<ChunkStatus, List<Consumer<ChunkAccess>>> statusWaiters = new Reference2ObjectOpenHashMap<>();
++    private final Reference2ObjectOpenHashMap<ChunkStatus, List<Consumer<ChunkAccess>>> statusWaiters = new Reference2ObjectOpenHashMap<>(2); // Quire - small initial capacity: almost always empty
+ 
+     void addStatusConsumer(final ChunkStatus status, final Consumer<ChunkAccess> consumer) {
+         this.statusWaiters.computeIfAbsent(status, (final ChunkStatus keyInMap) -> {
+@@ -1361,7 +1361,7 @@ public final class NewChunkHolder {
+         }, Priority.HIGHEST);
+     }
+ 
+-    private final Reference2ObjectOpenHashMap<FullChunkStatus, List<Consumer<LevelChunk>>> fullStatusWaiters = new Reference2ObjectOpenHashMap<>();
++    private final Reference2ObjectOpenHashMap<FullChunkStatus, List<Consumer<LevelChunk>>> fullStatusWaiters = new Reference2ObjectOpenHashMap<>(2); // Quire - small initial capacity: almost always empty
+ 
+     void addFullStatusConsumer(final FullChunkStatus status, final Consumer<LevelChunk> consumer) {
+         this.fullStatusWaiters.computeIfAbsent(status, (final FullChunkStatus keyInMap) -> {
+diff --git a/net/minecraft/server/PlayerAdvancements.java b/net/minecraft/server/PlayerAdvancements.java
+index e70701663abd6f19a506690167d80f0dceab8000..bb2c68ec02e1831faa73bbf4cf1feda399aba06f 100644
+--- a/net/minecraft/server/PlayerAdvancements.java
++++ b/net/minecraft/server/PlayerAdvancements.java
+@@ -237,7 +237,7 @@ public class PlayerAdvancements {
+             for (Entry<String, Criterion<?>> entry : holder.value().criteria().entrySet()) {
+                 CriterionProgress criterionProgress = advancementProgress.getCriterion(entry.getKey());
+                 if (criterionProgress != null && !criterionProgress.isDone()) {
+-                    this.addListener(entry.getValue(), new PlayerAdvancements.TriggerInstanceKey(holder, entry.getKey()));
++                    this.addListener(entry.getValue(), QUIRE_TRIGGER_KEYS.intern(new PlayerAdvancements.TriggerInstanceKey(holder, entry.getKey()))); // Quire - share keys between players
+                 }
+             }
+         }
+@@ -361,4 +361,8 @@ public class PlayerAdvancements {
+ 
+     public record TriggerInstanceKey(AdvancementHolder advancement, String criterion) {
+     }
++
++    // Quire - every online player holds a key per unfinished criterion (thousands each, mostly recipe unlocks);
++    // the keys are immutable records, equal across players, so they are shared (weakly: a reload drops old ones)
++    private static final com.google.common.collect.Interner<PlayerAdvancements.TriggerInstanceKey> QUIRE_TRIGGER_KEYS = com.google.common.collect.Interners.newWeakInterner();
+ }
+diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
+index dc0270de6d13b7b6fc5de463fab05e9cca842480..c1670a9e1d8362c47b8b00c5c73b8f7b0fb1f168 100644
+--- a/net/minecraft/world/level/chunk/LevelChunkSection.java
++++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
+@@ -28,7 +28,18 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+     private boolean isClient;
+     private static final short CLIENT_FORCED_SPECIAL_COLLIDING_BLOCKS = (short)9999;
+     private short specialCollidingBlocks;
+-    private final ca.spottedleaf.moonrise.common.list.ShortList tickingBlocks = new ca.spottedleaf.moonrise.common.list.ShortList();
++    // Quire start - allocate the ticking block list lazily: most sections never hold a randomly ticking block
++    private static final ca.spottedleaf.moonrise.common.list.ShortList EMPTY_TICKING_BLOCKS = new ca.spottedleaf.moonrise.common.list.ShortList(); // never mutated
++    private ca.spottedleaf.moonrise.common.list.@org.jspecify.annotations.Nullable ShortList tickingBlocks;
++
++    private ca.spottedleaf.moonrise.common.list.ShortList quire$tickingBlocks() {
++        ca.spottedleaf.moonrise.common.list.ShortList list = this.tickingBlocks;
++        if (list == null) {
++            this.tickingBlocks = list = new ca.spottedleaf.moonrise.common.list.ShortList();
++        }
++        return list;
++    }
++    // Quire end
+ 
+     @Override
+     public final boolean moonrise$hasSpecialCollidingBlocks() {
+@@ -37,7 +48,8 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+ 
+     @Override
+     public final ca.spottedleaf.moonrise.common.list.ShortList moonrise$getTickingBlockList() {
+-        return this.tickingBlocks;
++        final ca.spottedleaf.moonrise.common.list.ShortList list = this.tickingBlocks; // Quire - lazy list
++        return list == null ? EMPTY_TICKING_BLOCKS : list; // Quire - lazy list
+     }
+     // Paper end - block counting
+ 
+@@ -114,7 +126,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+         final boolean oldTicking = oldState.isRandomlyTicking();
+         final boolean newTicking = newState.isRandomlyTicking();
+         if (oldTicking != newTicking) {
+-            final ca.spottedleaf.moonrise.common.list.ShortList tickingBlocks = this.tickingBlocks;
++            final ca.spottedleaf.moonrise.common.list.ShortList tickingBlocks = this.quire$tickingBlocks(); // Quire - lazy list
+             final short position = (short)(x | (z << 4) | (y << (4+4)));
+ 
+             if (oldTicking) {
+@@ -197,7 +209,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+         this.tickingBlockCount = (short)0;
+         this.tickingFluidCount = (short)0;
+         this.specialCollidingBlocks = (short)0;
+-        this.tickingBlocks.clear();
++        this.tickingBlocks = null; // Quire - lazy list (recalculated below)
+ 
+         if (this.maybeHas((final BlockState state) -> !state.isAir())) {
+             final PalettedContainer.Data<BlockState> data = this.states.data;
+@@ -234,14 +246,12 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+                     final short[] raw = coordinates.elements();
+                     final int rawLen = raw.length;
+ 
+-                    final ca.spottedleaf.moonrise.common.list.ShortList tickingBlocks = this.tickingBlocks;
++                    final ca.spottedleaf.moonrise.common.list.ShortList tickingBlocks = this.quire$tickingBlocks(); // Quire - lazy list
+ 
+-                    tickingBlocks.setMinCapacity(Math.min((rawLen + tickingBlocks.size()) * 3 / 2, 16 * 16 * 16));
++                    // Quire - no over-allocation: addAllDistinct sizes the list exactly
+ 
+                     java.util.Objects.checkFromToIndex(0, paletteCount, raw.length);
+-                    for (int i = 0; i < paletteCount; ++i) {
+-                        tickingBlocks.add(raw[i]);
+-                    }
++                    tickingBlocks.addAllDistinct(raw, paletteCount); // Quire - list was cleared, palette entries cover disjoint positions
+                 }
+ 
+                 final FluidState fluid = state.getFluidState();
+diff --git a/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java b/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java
+index 43cb206216179cde09ee340b69b77b8b8848940b..e87011e2919a8d3e6264cfaf21e540db6c8974ee 100644
+--- a/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java
++++ b/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java
+@@ -768,6 +768,25 @@ public class StructureTemplate {
+         // CraftBukkit end
+     }
+ 
++    // Quire start - share template positions: cached templates hold hundreds of thousands of small relative
++    // positions, mostly the same few thousand values; BlockPos is immutable
++    private static final int QUIRE_POS_BITS = 6;
++    private static final BlockPos[] QUIRE_POS_CACHE = new BlockPos[1 << (3 * QUIRE_POS_BITS)];
++
++    private static BlockPos quire$internPos(final int x, final int y, final int z) {
++        final int limit = 1 << QUIRE_POS_BITS;
++        if (x < 0 || y < 0 || z < 0 || x >= limit || y >= limit || z >= limit) {
++            return new BlockPos(x, y, z);
++        }
++        final int index = (((y << QUIRE_POS_BITS) | z) << QUIRE_POS_BITS) | x;
++        BlockPos pos = QUIRE_POS_CACHE[index];
++        if (pos == null) {
++            QUIRE_POS_CACHE[index] = pos = new BlockPos(x, y, z); // benign race: any instance is equal
++        }
++        return pos;
++    }
++    // Quire end - share template positions
++
+     private void loadPalette(final HolderGetter<Block> blockLookup, final ListTag paletteList, final ListTag blockList) {
+         StructureTemplate.SimplePalette palette = new StructureTemplate.SimplePalette();
+ 
+@@ -780,7 +799,7 @@ public class StructureTemplate {
+         List<StructureTemplate.StructureBlockInfo> otherBlocksList = Lists.newArrayList();
+         blockList.compoundStream().forEach(blockTag -> {
+             ListTag posTag = blockTag.getListOrEmpty("pos");
+-            BlockPos pos = new BlockPos(posTag.getIntOr(0, 0), posTag.getIntOr(1, 0), posTag.getIntOr(2, 0));
++            BlockPos pos = quire$internPos(posTag.getIntOr(0, 0), posTag.getIntOr(1, 0), posTag.getIntOr(2, 0)); // Quire - share template positions
+             BlockState state = palette.stateFor(blockTag.getIntOr("state", 0));
+             CompoundTag nbt = blockTag.getCompound("nbt").orElse(null);
+             StructureTemplate.StructureBlockInfo info = new StructureTemplate.StructureBlockInfo(pos, state, nbt);
+diff --git a/net/minecraft/world/level/pathfinder/BinaryHeap.java b/net/minecraft/world/level/pathfinder/BinaryHeap.java
+index 2cb6d1322e44a683e790f9ff4d989aea3b9472b1..7931728c12a7e3eab9592de2c2191fbe51b9ef03 100644
+--- a/net/minecraft/world/level/pathfinder/BinaryHeap.java
++++ b/net/minecraft/world/level/pathfinder/BinaryHeap.java
+@@ -27,6 +27,17 @@ public class BinaryHeap {
+         this.size = 0;
+     }
+ 
++    // Quire start - drop references to the last search's nodes (clear() keeps them in the array)
++    public void release() {
++        this.size = 0;
++        if (this.heap.length > 128) {
++            this.heap = new Node[128];
++        } else {
++            java.util.Arrays.fill(this.heap, null);
++        }
++    }
++    // Quire end
++
+     public Node peek() {
+         return this.heap[0];
+     }
+diff --git a/net/minecraft/world/level/pathfinder/NodeEvaluator.java b/net/minecraft/world/level/pathfinder/NodeEvaluator.java
+index f4a30761483c4032b5942f84df7706b10976cb5d..e4092bff0d478e939dbc2fdc569d7e2b44d7cbd9 100644
+--- a/net/minecraft/world/level/pathfinder/NodeEvaluator.java
++++ b/net/minecraft/world/level/pathfinder/NodeEvaluator.java
+@@ -35,6 +35,10 @@ public abstract class NodeEvaluator {
+     public void done() {
+         this.currentContext = null;
+         this.mob = null;
++        // Quire start - release the search graph (rebuilt from scratch by every search) instead of keeping it per mob
++        this.nodes.clear();
++        ((it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<Node>)this.nodes).trim(64);
++        // Quire end
+     }
+ 
+     protected Node getNode(final BlockPos pos) {
+diff --git a/net/minecraft/world/level/pathfinder/PathFinder.java b/net/minecraft/world/level/pathfinder/PathFinder.java
+index b903ae067130b460fca782fa8f37e9405670eeee..1b0c331033bacf80c085adac7104a7655070ac0e 100644
+--- a/net/minecraft/world/level/pathfinder/PathFinder.java
++++ b/net/minecraft/world/level/pathfinder/PathFinder.java
+@@ -63,6 +63,7 @@ public class PathFinder {
+         // Paper end - Perf: remove streams and optimize collection
+         Path path = this.findPath(from, tos, maxPathLength, reachRange, maxVisitedNodesMultiplier);
+         this.nodeEvaluator.done();
++        this.openSet.release(); // Quire - do not keep the search's nodes alive
+         return path;
+     }
+ 
+diff --git a/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java b/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java
+index 7beeebdf6ddef8114ff8f56f438776c4daf1aa3e..5eb2bb21332de92cc14336ad3a3ce8f32736fdb6 100644
+--- a/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java
++++ b/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java
+@@ -45,6 +45,10 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+         this.mob.onPathfindingDone();
+         this.pathTypesByPosCacheByMob.clear();
+         this.collisionCache.clear();
++        // Quire start - do not keep the peak capacity of per-search caches for every mob
++        ((Long2ObjectOpenHashMap<PathType>)this.pathTypesByPosCacheByMob).trim(64);
++        ((it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap<AABB>)this.collisionCache).trim(64);
++        // Quire end
+         super.done();
+     }
+ 
+diff --git a/net/minecraft/world/phys/shapes/VoxelShape.java b/net/minecraft/world/phys/shapes/VoxelShape.java
+index cbf479b7337a78b9980926b8ba984c4546bf9c3d..b3edb087a7fd3e5d3dab3d45361642a375e4ca77 100644
+--- a/net/minecraft/world/phys/shapes/VoxelShape.java
++++ b/net/minecraft/world/phys/shapes/VoxelShape.java
+@@ -160,7 +160,7 @@ public abstract class VoxelShape implements ca.spottedleaf.moonrise.patches.coll
+ 
+         final Direction.Axis axis = direction.getAxis();
+ 
+-        final VoxelShape ret;
++        VoxelShape ret; // Quire - not final, interned below
+ 
+         if (direction.getAxisDirection() == Direction.AxisDirection.POSITIVE) {
+             if (DoubleMath.fuzzyEquals(this.max(axis), 1.0, ca.spottedleaf.moonrise.patches.collisions.CollisionUtil.COLLISION_EPSILON)) {
+@@ -176,6 +176,7 @@ public abstract class VoxelShape implements ca.spottedleaf.moonrise.patches.coll
+             }
+         }
+ 
++        ret = dev.quire.memory.ShapeInterner.intern(ret); // Quire - share identical face shapes
+         cache[direction.ordinal()] = ret;
+ 
+         return ret;
+@@ -831,7 +832,7 @@ public abstract class VoxelShape implements ca.spottedleaf.moonrise.patches.coll
+                 this.faces = new VoxelShape[6];
+             }
+ 
+-            VoxelShape face = this.calculateFace(direction);
++            VoxelShape face = dev.quire.memory.ShapeInterner.intern(this.calculateFace(direction)); // Quire - share identical face shapes
+             this.faces[direction.ordinal()] = face;
+             return face;
+         } else {
+diff --git a/net/minecraft/world/ticks/LevelChunkTicks.java b/net/minecraft/world/ticks/LevelChunkTicks.java
+index 88eb48034d8022600dc08b4dcf6162bbdd8c6d33..c3e8fb3ebc133a23c435c1b8f519cd297cff8636 100644
+--- a/net/minecraft/world/ticks/LevelChunkTicks.java
++++ b/net/minecraft/world/ticks/LevelChunkTicks.java
+@@ -16,7 +16,8 @@ import org.jspecify.annotations.Nullable;
+ 
+ public class LevelChunkTicks<T> implements TickContainerAccess<T>, SerializableTickContainer<T>, ca.spottedleaf.moonrise.patches.chunk_system.ticks.ChunkSystemLevelChunkTicks { // Paper - rewrite chunk system
+     private static final Comparator<ScheduledTick<?>> SUB_TICK_ORDERING = Comparator.comparingLong(ScheduledTick::subTickOrder);
+-    private final Queue<ScheduledTick<T>> tickQueue = new PriorityQueue<>(ScheduledTick.DRAIN_ORDER);
++    private Queue<ScheduledTick<T>> tickQueue = new PriorityQueue<>(ScheduledTick.DRAIN_ORDER); // Quire - not final: replaced when drained after growing
++    private int quirePeak; // Quire - largest queue size since the queue was last replaced
+     private @Nullable List<SavedTick<T>> pendingTicks;
+     private final Set<ScheduledTick<?>> ticksPerPosition = new ObjectOpenCustomHashSet<>(ScheduledTick.UNIQUE_TICK_HASH);
+     private @Nullable BiConsumer<LevelChunkTicks<T>, ScheduledTick<T>> onTickAdded;
+@@ -68,6 +69,13 @@ public class LevelChunkTicks<T> implements TickContainerAccess<T>, SerializableT
+         ScheduledTick<T> result = this.tickQueue.poll();
+         if (result != null) {
+             this.ticksPerPosition.remove(result); this.dirty = true; // Paper - rewrite chunk system
++            // Quire start - a drained queue keeps its peak capacity (worldgen water/lava bursts); start over small
++            if (this.quirePeak > 32 && this.tickQueue.isEmpty()) {
++                this.tickQueue = new PriorityQueue<>(ScheduledTick.DRAIN_ORDER);
++                ((ObjectOpenCustomHashSet<ScheduledTick<?>>)this.ticksPerPosition).trim();
++                this.quirePeak = 0;
++            }
++            // Quire end
+         }
+ 
+         return result;
+@@ -82,6 +90,7 @@ public class LevelChunkTicks<T> implements TickContainerAccess<T>, SerializableT
+ 
+     private void scheduleUnchecked(final ScheduledTick<T> tick) {
+         this.tickQueue.add(tick);
++        if (this.tickQueue.size() > this.quirePeak) this.quirePeak = this.tickQueue.size(); // Quire
+         if (this.onTickAdded != null) {
+             this.onTickAdded.accept(this, tick);
+         }

@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 18:31:26 +0800
+Subject: [PATCH] Index waypoint connections both ways and evaluate them once
+ per tick
+
+The Guava table scanned every row per lookup and copied entry sets on every position change, and every position change (several per tick per player) re-evaluated all of that entity's connections. Now connections are indexed by player and by waypoint, and moved entities are marked dirty and evaluated once at the end of the tick, before packets are flushed.
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index c3bf41af0273e902f881cc070fcef6dd64abb063..109c8fe91a2c39f25d7fe2b93e24863c21295376 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1832,6 +1832,13 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             tickable.run();
+         }
+ 
++        // Quire start - evaluate waypoint connections once per tick for everything that moved
++        profiler.popPush("waypoints");
++        for (ServerLevel level : this.getAllLevels()) {
++            level.getWaypointManager().quire$flushDirty();
++        }
++        // Quire end
++
+         profiler.popPush("send chunks");
+ 
+         for (ServerPlayer player : this.playerList.getPlayers()) {
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index c4cfb53e145d69666ffc27ef4ee0c50b54eb9143..fb14336dc825ad7fac5e95d06b10ae5249e1e753 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -725,7 +725,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         if (!player.isRemoved()) {
+             this.chunkMap.move(player);
+             if (player.isReceivingWaypoints()) {
+-                this.level.getWaypointManager().updatePlayer(player);
++                this.level.getWaypointManager().quire$markPlayerMoved(player); // Quire - coalesced once per tick
+             }
+         }
+     }
+diff --git a/net/minecraft/server/waypoints/ServerWaypointManager.java b/net/minecraft/server/waypoints/ServerWaypointManager.java
+index b9748a392c9f76e61a1b673085b4dd74c007c70d..bcd60a2bbc7b24b9925f4c14f689a55d1e567556 100644
+--- a/net/minecraft/server/waypoints/ServerWaypointManager.java
++++ b/net/minecraft/server/waypoints/ServerWaypointManager.java
+@@ -1,15 +1,10 @@
+ package net.minecraft.server.waypoints;
+ 
+-import com.google.common.collect.HashBasedTable;
+-import com.google.common.collect.ImmutableSet;
+-import com.google.common.collect.Sets;
+-import com.google.common.collect.Table;
+-import com.google.common.collect.Tables;
+-import com.google.common.collect.Sets.SetView;
++import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.Map.Entry;
+ import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.world.level.gamerules.GameRules;
+ import net.minecraft.world.waypoints.WaypointManager;
+@@ -18,7 +13,12 @@ import net.minecraft.world.waypoints.WaypointTransmitter;
+ public class ServerWaypointManager implements WaypointManager<WaypointTransmitter> {
+     private final Set<WaypointTransmitter> waypoints = new HashSet<>();
+     private final Set<ServerPlayer> players = new HashSet<>();
+-    private final Table<ServerPlayer, WaypointTransmitter, WaypointTransmitter.Connection> connections = HashBasedTable.create();
++    // Quire start - index connections both ways instead of a Guava Table
++    // Table#column / Tables.transpose(...).row(...) scanned every row on each lookup and the
++    // ImmutableSet copies allocated per call; both ran for every position change of every player.
++    private final Map<ServerPlayer, Map<WaypointTransmitter, WaypointTransmitter.Connection>> byPlayer = new HashMap<>();
++    private final Map<WaypointTransmitter, Map<ServerPlayer, WaypointTransmitter.Connection>> byWaypoint = new HashMap<>();
++    // Quire end - index connections both ways instead of a Guava Table
+     // Paper start - optimize ServerWaypointManager with locator bar disabled
+     public boolean locatorBarEnabled; // Avoid a gamerule lookup for each player
+ 
+@@ -27,6 +27,79 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     }
+     // Paper end - optimize ServerWaypointManager with locator bar disabled
+ 
++    // Quire start - connection index helpers
++    private WaypointTransmitter.@org.jspecify.annotations.Nullable Connection getConnection(final ServerPlayer player, final WaypointTransmitter waypoint) {
++        final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(player);
++        return row == null ? null : row.get(waypoint);
++    }
++
++    private void putConnection(final ServerPlayer player, final WaypointTransmitter waypoint, final WaypointTransmitter.Connection connection) {
++        this.byPlayer.computeIfAbsent(player, k -> new LinkedHashMap<>()).put(waypoint, connection);
++        this.byWaypoint.computeIfAbsent(waypoint, k -> new LinkedHashMap<>()).put(player, connection);
++    }
++
++    private WaypointTransmitter.@org.jspecify.annotations.Nullable Connection removeConnection(final ServerPlayer player, final WaypointTransmitter waypoint) {
++        final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(player);
++        if (row == null) {
++            return null;
++        }
++        final WaypointTransmitter.Connection removed = row.remove(waypoint);
++        if (removed == null) {
++            return null;
++        }
++        if (row.isEmpty()) {
++            this.byPlayer.remove(player);
++        }
++        final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.get(waypoint);
++        if (column != null) {
++            column.remove(player);
++            if (column.isEmpty()) {
++                this.byWaypoint.remove(waypoint);
++            }
++        }
++        return removed;
++    }
++    // Quire end - connection index helpers
++
++    // Quire start - coalesce position-driven updates to once per tick
++    // Entities can change position several times per tick (move packet, collision, tick snap-back); each
++    // change used to re-evaluate every connection of the entity. Only the end-of-tick state reaches clients
++    // (packets are flushed at the end of the tick), so evaluate once, after everything has moved.
++    private final java.util.LinkedHashSet<WaypointTransmitter> quireDirtyWaypoints = new java.util.LinkedHashSet<>();
++    private final java.util.LinkedHashSet<ServerPlayer> quireDirtyPlayers = new java.util.LinkedHashSet<>();
++
++    public void quire$markWaypointMoved(final WaypointTransmitter waypoint) {
++        if (this.locatorBarEnabled) {
++            this.quireDirtyWaypoints.add(waypoint);
++        }
++    }
++
++    public void quire$markPlayerMoved(final ServerPlayer player) {
++        if (this.locatorBarEnabled) {
++            this.quireDirtyPlayers.add(player);
++        }
++    }
++
++    public void quire$flushDirty() {
++        if (!this.quireDirtyWaypoints.isEmpty()) {
++            final WaypointTransmitter[] dirty = this.quireDirtyWaypoints.toArray(new WaypointTransmitter[0]);
++            this.quireDirtyWaypoints.clear();
++            for (final WaypointTransmitter waypoint : dirty) {
++                this.updateWaypoint(waypoint); // no-op unless still tracked
++            }
++        }
++        if (!this.quireDirtyPlayers.isEmpty()) {
++            final ServerPlayer[] dirty = this.quireDirtyPlayers.toArray(new ServerPlayer[0]);
++            this.quireDirtyPlayers.clear();
++            for (final ServerPlayer player : dirty) {
++                if (this.players.contains(player) && !player.isRemoved() && player.isReceivingWaypoints() && player.connection != null) {
++                    this.updatePlayer(player);
++                }
++            }
++        }
++    }
++    // Quire end - coalesce position-driven updates to once per tick
++
+     @Override
+     public void trackWaypoint(final WaypointTransmitter waypoint) {
+         this.waypoints.add(waypoint);
+@@ -41,23 +114,49 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     public void updateWaypoint(final WaypointTransmitter waypoint) {
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         if (this.waypoints.contains(waypoint)) {
+-            Map<ServerPlayer, WaypointTransmitter.Connection> playerConnection = Tables.transpose(this.connections).row(waypoint);
+-            SetView<ServerPlayer> potentialPlayers = Sets.difference(this.players, playerConnection.keySet());
+-
+-            for (Entry<ServerPlayer, WaypointTransmitter.Connection> waypointConnection : ImmutableSet.copyOf(playerConnection.entrySet())) {
+-                this.updateConnection(waypointConnection.getKey(), waypoint, waypointConnection.getValue());
++            // Quire start - snapshot into arrays instead of ImmutableSet.copyOf; same iteration order
++            final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.get(waypoint);
++            if (column != null) {
++                final int size = column.size();
++                final ServerPlayer[] players = new ServerPlayer[size];
++                final WaypointTransmitter.Connection[] connections = new WaypointTransmitter.Connection[size];
++                int i = 0;
++                for (final Map.Entry<ServerPlayer, WaypointTransmitter.Connection> entry : column.entrySet()) {
++                    players[i] = entry.getKey();
++                    connections[i++] = entry.getValue();
++                }
++                for (i = 0; i < size; ++i) {
++                    this.updateConnection(players[i], waypoint, connections[i]);
++                }
+             }
+ 
+-            for (ServerPlayer player : potentialPlayers) {
+-                this.createConnection(player, waypoint);
++            // Same as the live Sets.difference view: re-checked after the updates above
++            for (ServerPlayer player : this.players) {
++                if (this.getConnection(player, waypoint) == null) {
++                    this.createConnection(player, waypoint);
++                }
+             }
++            // Quire end - snapshot into arrays instead of ImmutableSet.copyOf; same iteration order
+         }
+     }
+ 
+     @Override
+     public void untrackWaypoint(final WaypointTransmitter waypoint) {
+-        this.connections.column(waypoint).forEach((player, connection) -> connection.disconnect());
+-        Tables.transpose(this.connections).row(waypoint).clear();
++        // Quire start - connection index
++        final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.remove(waypoint);
++        if (column != null) {
++            for (final Map.Entry<ServerPlayer, WaypointTransmitter.Connection> entry : column.entrySet()) {
++                entry.getValue().disconnect();
++                final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(entry.getKey());
++                if (row != null) {
++                    row.remove(waypoint);
++                    if (row.isEmpty()) {
++                        this.byPlayer.remove(entry.getKey());
++                    }
++                }
++            }
++        }
++        // Quire end - connection index
+         this.waypoints.remove(waypoint);
+     }
+ 
+@@ -77,30 +176,63 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+ 
+     public void updatePlayer(final ServerPlayer player) {
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+-        Map<WaypointTransmitter, WaypointTransmitter.Connection> waypointConnections = this.connections.row(player);
+-        SetView<WaypointTransmitter> potentialWaypoints = Sets.difference(this.waypoints, waypointConnections.keySet());
+-
+-        for (Entry<WaypointTransmitter, WaypointTransmitter.Connection> waypointConnection : ImmutableSet.copyOf(waypointConnections.entrySet())) {
+-            this.updateConnection(player, waypointConnection.getKey(), waypointConnection.getValue());
++        // Quire start - snapshot into arrays instead of ImmutableSet.copyOf; same iteration order
++        final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.get(player);
++        if (row != null) {
++            final int size = row.size();
++            final WaypointTransmitter[] waypoints = new WaypointTransmitter[size];
++            final WaypointTransmitter.Connection[] connections = new WaypointTransmitter.Connection[size];
++            int i = 0;
++            for (final Map.Entry<WaypointTransmitter, WaypointTransmitter.Connection> entry : row.entrySet()) {
++                waypoints[i] = entry.getKey();
++                connections[i++] = entry.getValue();
++            }
++            for (i = 0; i < size; ++i) {
++                this.updateConnection(player, waypoints[i], connections[i]);
++            }
+         }
+ 
+-        for (WaypointTransmitter waypoint : potentialWaypoints) {
+-            this.createConnection(player, waypoint);
++        // Same as the live Sets.difference view: re-checked after the updates above
++        for (WaypointTransmitter waypoint : this.waypoints) {
++            if (this.getConnection(player, waypoint) == null) {
++                this.createConnection(player, waypoint);
++            }
+         }
++        // Quire end - snapshot into arrays instead of ImmutableSet.copyOf; same iteration order
+     }
+ 
+     public void removePlayer(final ServerPlayer player) {
+-        this.connections.row(player).values().removeIf(connection -> {
+-            connection.disconnect();
+-            return true;
+-        });
++        // Quire start - connection index
++        final Map<WaypointTransmitter, WaypointTransmitter.Connection> row = this.byPlayer.remove(player);
++        if (row != null) {
++            for (final Map.Entry<WaypointTransmitter, WaypointTransmitter.Connection> entry : row.entrySet()) {
++                entry.getValue().disconnect();
++                final Map<ServerPlayer, WaypointTransmitter.Connection> column = this.byWaypoint.get(entry.getKey());
++                if (column != null) {
++                    column.remove(player);
++                    if (column.isEmpty()) {
++                        this.byWaypoint.remove(entry.getKey());
++                    }
++                }
++            }
++        }
++        // Quire end - connection index
+         this.untrackWaypoint(player);
+         this.players.remove(player);
++        this.quireDirtyPlayers.remove(player); // Quire - coalesced updates
++        this.quireDirtyWaypoints.remove(player); // Quire - coalesced updates
+     }
+ 
+     public void breakAllConnections() {
+-        this.connections.values().forEach(WaypointTransmitter.Connection::disconnect);
+-        this.connections.clear();
++        // Quire start - connection index
++        for (final Map<WaypointTransmitter, WaypointTransmitter.Connection> row : this.byPlayer.values()) {
++            for (final WaypointTransmitter.Connection connection : row.values()) {
++                connection.disconnect();
++            }
++        }
++        this.byPlayer.clear();
++        this.byWaypoint.clear();
++        // Quire end - connection index
+     }
+ 
+     public void remakeConnections(final WaypointTransmitter waypoint) {
+@@ -125,10 +257,10 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         if (player != waypoint) {
+             if (isLocatorBarEnabledFor(player)) {
+                 waypoint.makeWaypointConnectionWith(player).ifPresentOrElse(connection -> {
+-                    this.connections.put(player, waypoint, connection);
++                    this.putConnection(player, waypoint, connection); // Quire - connection index
+                     connection.connect();
+                 }, () -> {
+-                    WaypointTransmitter.Connection connection = this.connections.remove(player, waypoint);
++                    WaypointTransmitter.Connection connection = this.removeConnection(player, waypoint); // Quire - connection index
+                     if (connection != null) {
+                         connection.disconnect();
+                     }
+@@ -145,10 +277,10 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+                 } else {
+                     waypoint.makeWaypointConnectionWith(player).ifPresentOrElse(newConnection -> {
+                         newConnection.connect();
+-                        this.connections.put(player, waypoint, newConnection);
++                        this.putConnection(player, waypoint, newConnection); // Quire - connection index
+                     }, () -> {
+                         connection.disconnect();
+-                        this.connections.remove(player, waypoint);
++                        this.removeConnection(player, waypoint); // Quire - connection index
+                     });
+                 }
+             }
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index cf3619b6de23f32e9e5a81fbe287fb438ecfcabc..662d615b15cfc079d7d66da1b904123609e5ce25 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -5198,11 +5198,11 @@ public abstract class Entity
+             this.levelCallback.onMove();
+             if (!this.firstTick && this.level instanceof ServerLevel serverLevel && !this.isRemoved()) {
+                 if (this instanceof WaypointTransmitter waypoint && waypoint.isTransmittingWaypoint()) {
+-                    serverLevel.getWaypointManager().updateWaypoint(waypoint);
++                    serverLevel.getWaypointManager().quire$markWaypointMoved(waypoint); // Quire - coalesced once per tick
+                 }
+ 
+                 if (this instanceof ServerPlayer player && player.isReceivingWaypoints() && player.connection != null) {
+-                    serverLevel.getWaypointManager().updatePlayer(player);
++                    serverLevel.getWaypointManager().quire$markPlayerMoved(player); // Quire - coalesced once per tick
+                 }
+             }
+             // Paper start - Fix MC-44654

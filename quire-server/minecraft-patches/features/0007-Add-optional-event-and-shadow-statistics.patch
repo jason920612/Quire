@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 20:08:56 +0800
+Subject: [PATCH] Add optional event and shadow statistics
+
+-Dquire.eventStats=true records per-event dispatch counts and listener time; -Dquire.shadow=true records, for every entity/block entity/chunk tick unit, how far from its own chunk it reached and whether it fired a listened event. Both are off by default (static final flags).
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 328784ba08236553e49d62320b79f7222292412f..31689cbde87c41b57e71f6ec01c06c9ad11b3f0c 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -573,6 +573,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -612,6 +613,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -652,6 +654,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -692,6 +695,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -734,6 +738,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -776,6 +781,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -818,6 +824,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 109c8fe91a2c39f25d7fe2b93e24863c21295376..3e31b6531aa2320c03a610b2ef64d60fd2392433 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1790,6 +1790,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         }
+ 
+         profiler.push("levels");
++        if (dev.quire.stats.EventStats.ENABLED) dev.quire.stats.EventStats.tick(); // Quire - event stats
+         this.updateEffectiveRespawnData();
+ 
+         this.isIteratingOverLevels = true; // Paper - Throw exception on world create while being ticked
+@@ -1802,11 +1803,14 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             profiler.push("tick");
+ 
+             try {
++                dev.quire.stats.EventStats.inLevelTick = true; // Quire - event stats
+                 level.tick(haveTime);
+             } catch (Throwable t) {
+                 CrashReport report = CrashReport.forThrowable(t, "Exception ticking world");
+                 level.fillReportDetails(report);
+                 throw new ReportedException(report);
++            } finally {
++                dev.quire.stats.EventStats.inLevelTick = false; // Quire - event stats
+             }
+ 
+             profiler.pop();
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index 88ea1631b578f61d5bab427e07327541535953ff..ef0b8ae834e55ead415e6389496ba692257dc481 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -135,6 +135,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+     private ChunkAccess getChunkFallback(final int chunkX, final int chunkZ, final ChunkStatus toStatus,
+                                          final boolean load) {
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.access(chunkX, chunkZ); // Quire - shadow stats
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler chunkTaskScheduler = ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this.level).moonrise$getChunkTaskScheduler();
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager chunkHolderManager = chunkTaskScheduler.chunkHolderManager;
+ 
+@@ -176,7 +177,10 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+         java.util.Objects.checkFromToIndex(0, size, raw.length);
+         for (int i = 0; i < size; ++i) {
++            if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.begin("chunk tick", raw[i].locX, raw[i].locZ); // Quire - shadow stats
++            try { // Quire - shadow stats
+             world.tickChunk(raw[i], randomTickSpeed);
++            } finally { if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.end(); } // Quire - shadow stats
+ 
+             // call mid-tick tasks for chunk system
+             if ((i & 7) == 0) {
+@@ -293,6 +297,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     private volatile boolean quireCacheInvalidated;
+ 
+     private LevelChunk quire$getFullChunk(final int x, final int z) {
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.access(x, z); // Quire - shadow stats
+         final long key = ChunkPos.pack(x, z);
+         if (Thread.currentThread() != this.mainThread) {
+             return this.fullChunks.get(key);
+@@ -644,7 +649,10 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+             profiler.popPush("tickSpawningChunks");
+ 
+             for (LevelChunk chunk : spawningChunks) {
++                if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.begin("chunk spawning", chunk.locX, chunk.locZ); // Quire - shadow stats
++                try { // Quire - shadow stats
+                 this.tickSpawningChunk(chunk, spawningCategories, spawnCookie);
++                } finally { if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.end(); } // Quire - shadow stats
+             }
+         } finally {
+             spawningChunks.clear();
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 8389d812b2d80a122fd1945b3182c08cdeda7d1c..8bad6491fa0f150f5a26400e0bc8811395951510 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -335,6 +335,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+ 
+     @Override
+     public final ChunkAccess moonrise$getAnyChunkIfLoaded(final int chunkX, final int chunkZ) {
++        if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.access(chunkX, chunkZ); // Quire - shadow stats
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder newChunkHolder = this.moonrise$getChunkTaskScheduler().chunkHolderManager.getChunkHolder(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkX, chunkZ));
+         if (newChunkHolder == null) {
+             return null;
+@@ -908,7 +909,10 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                                     }
+ 
+                                     profiler.push("tick");
++                                    if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.begin("entity " + net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath(), entity.chunkPosition().x(), entity.chunkPosition().z()); // Quire - shadow stats
++                                    try { // Quire - shadow stats
+                                     this.guardEntityTick(this::tickNonPassenger, entity);
++                                    } finally { if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.end(); } // Quire - shadow stats
+                                     profiler.pop();
+                                 }
+                             }
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 21878bd770f6c0bc10dd0a67be5bd94d7e16f741..5d53e2b44e92420a32dc996c4bf81296dc5be1ec 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -1505,7 +1505,10 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+             if (ticker.isRemoved()) {
+                 toRemove.add(ticker); // Paper - Fix MC-117075 use removeAll
+             } else if (tickBlockEntities && this.shouldTickBlocksAt(ticker.getPos())) {
++                if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.begin("blockentity " + ticker.getType(), ticker.getPos().getX() >> 4, ticker.getPos().getZ() >> 4); // Quire - shadow stats
++                try { // Quire - shadow stats
+                 ticker.tick();
++                } finally { if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.end(); } // Quire - shadow stats
+                 // Paper start - rewrite chunk system
+                 if ((++tickedEntities & 7) == 0) {
+                     ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)(Level)(Object)this).moonrise$midTickTasks();

@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 18:05:49 +0800
+Subject: [PATCH] Skip BlockPhysicsEvent construction in NeighborUpdater when
+ nothing listens
+
+Every other BlockPhysicsEvent call site is guarded by ServerLevel#hasPhysicsEvent; the hottest one (neighbour updates) was not, costing ~10% MSPT and ~37% of allocations in redstone-heavy worlds.
+
+diff --git a/net/minecraft/world/level/redstone/NeighborUpdater.java b/net/minecraft/world/level/redstone/NeighborUpdater.java
+index 041ed95948ff6bb4cf3610ce4522a6ba105b6812..88d3d2936b3dabbd57a075ea0ef099f32ecdb4e5 100644
+--- a/net/minecraft/world/level/redstone/NeighborUpdater.java
++++ b/net/minecraft/world/level/redstone/NeighborUpdater.java
+@@ -74,12 +74,14 @@ public interface NeighborUpdater {
+         // Paper end - Add source block to BlockPhysicsEvent
+         try {
+             // CraftBukkit start
++            if (!(level instanceof net.minecraft.server.level.ServerLevel serverLevel) || serverLevel.hasPhysicsEvent) { // Quire - skip building the event when nothing listens, like every other BlockPhysicsEvent call site
+             org.bukkit.event.block.BlockPhysicsEvent event = new org.bukkit.event.block.BlockPhysicsEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), state.asBlockData(), org.bukkit.craftbukkit.block.CraftBlock.at(level, sourcePos)); // Paper - Add source block to BlockPhysicsEvent
+             level.getCraftServer().getPluginManager().callEvent(event);
+ 
+             if (event.isCancelled()) {
+                 return;
+             }
++            } // Quire
+             // CraftBukkit end
+             state.handleNeighborChanged(level, pos, changedBlock, orientation, movedByPiston);
+             // Spigot start

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 18:31:51 +0800
+Subject: [PATCH] Share ZeroBitStorage instances and pool block-stepping
+ scratch sets
+
+ZeroBitStorage is stateless (copy() already returned this). forEachBlockIntersectedBetween allocated a LongOpenHashSet per moving entity per tick.
+
+diff --git a/net/minecraft/util/ZeroBitStorage.java b/net/minecraft/util/ZeroBitStorage.java
+index a6b5e56465a867a830a920cb4745ee85190b2f0a..90ada4f71dc57b84ead289e934c9ab7493fa17ec 100644
+--- a/net/minecraft/util/ZeroBitStorage.java
++++ b/net/minecraft/util/ZeroBitStorage.java
+@@ -12,6 +12,15 @@ public class ZeroBitStorage implements BitStorage {
+         this.size = size;
+     }
+ 
++    // Quire start - share the stateless instances (copy() already returns this); one per chunk section otherwise
++    private static final ZeroBitStorage SIZE_64 = new ZeroBitStorage(64);
++    private static final ZeroBitStorage SIZE_4096 = new ZeroBitStorage(4096);
++
++    public static ZeroBitStorage of(final int size) {
++        return size == 4096 ? SIZE_4096 : size == 64 ? SIZE_64 : new ZeroBitStorage(size);
++    }
++    // Quire end
++
+     @Override
+     public final int getAndSet(final int index, final int value) { // Paper - Perf: Optimize SimpleBitStorage
+         //Validate.inclusiveBetween(0L, this.size - 1, index); // Paper - Perf: Optimize SimpleBitStorage
+diff --git a/net/minecraft/world/level/BlockGetter.java b/net/minecraft/world/level/BlockGetter.java
+index 2a4c928281c7e455d6f210aeb599881855d328f8..0d9a1b659833a8f101c5e46af40ada33b91f8ad2 100644
+--- a/net/minecraft/world/level/BlockGetter.java
++++ b/net/minecraft/world/level/BlockGetter.java
+@@ -217,7 +217,11 @@ public interface BlockGetter extends LevelHeightAccessor {
+ 
+             return true;
+         } else {
+-            LongSet visitedBlocks = new LongOpenHashSet();
++            // Quire start - pooled scratch set instead of a new LongOpenHashSet per moving entity per tick
++            final dev.quire.util.LongSetPool pool = dev.quire.util.LongSetPool.get();
++            final LongOpenHashSet visitedBlocks = pool.acquire();
++            try {
++            // Quire end
+ 
+             for (BlockPos blockPos : BlockPos.betweenCornersInDirection(aabbAtTarget.move(travel.scale(-1.0)), travel)) {
+                 if (!visitor.visit(blockPos, 0)) {
+@@ -239,6 +243,9 @@ public interface BlockGetter extends LevelHeightAccessor {
+             }
+ 
+             return true;
++            } finally { // Quire
++                pool.release(visitedBlocks); // Quire
++            } // Quire
+         }
+     }
+ 
+diff --git a/net/minecraft/world/level/chunk/PalettedContainer.java b/net/minecraft/world/level/chunk/PalettedContainer.java
+index 55037971b2631100ac5fd5fd8157adbbc0604d36..bf5b2e8745f50287ed5628d09a5288ce19cd30da 100644
+--- a/net/minecraft/world/level/chunk/PalettedContainer.java
++++ b/net/minecraft/world/level/chunk/PalettedContainer.java
+@@ -163,7 +163,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         }
+ 
+         BitStorage storage = dataConfiguration.bitsInMemory() == 0
+-            ? new ZeroBitStorage(this.strategy.entryCount())
++            ? ZeroBitStorage.of(this.strategy.entryCount()) // Quire - shared instance
+             : new SimpleBitStorage(dataConfiguration.bitsInMemory(), this.strategy.entryCount());
+         Palette<T> palette = dataConfiguration.createPalette(this.strategy, List.of());
+         return new PalettedContainer.Data<>(dataConfiguration, storage, palette);
+@@ -315,7 +315,7 @@ public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainer
+         Palette<T> palette;
+         if (storedConfiguration.bitsInMemory() == 0) {
+             palette = storedConfiguration.createPalette(strategy, paletteEntries);
+-            storage = new ZeroBitStorage(entryCount);
++            storage = ZeroBitStorage.of(entryCount); // Quire - shared instance
+         } else {
+             Optional<LongStream> dataOpt = discData.storage();
+             if (dataOpt.isEmpty()) {

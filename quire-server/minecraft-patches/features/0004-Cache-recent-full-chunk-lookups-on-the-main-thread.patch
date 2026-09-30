@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 18:31:51 +0800
+Subject: [PATCH] Cache recent full chunk lookups on the main thread
+
+Direct-mapped 4x4 cache in front of the concurrent fullChunks table; evicted on every full chunk status change.
+
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index fb14336dc825ad7fac5e95d06b10ae5249e1e753..88ea1631b578f61d5bab427e07327541535953ff 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -86,6 +86,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     @Override
+     public final void moonrise$setFullChunk(final int chunkX, final int chunkZ, final LevelChunk chunk) {
+         final long key = ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkX, chunkZ);
++        this.quire$invalidateCachedChunk(chunkX, chunkZ, key); // Quire - main thread chunk cache
+         if (chunk == null) {
+             this.fullChunks.remove(key);
+         } else {
+@@ -280,8 +281,50 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+     @Nullable
+     public LevelChunk getChunkAtIfLoadedImmediately(int x, int z) {
+-        return this.fullChunks.get(ChunkPos.pack(x, z));
++        return this.quire$getFullChunk(x, z); // Quire - main thread chunk cache
+     }
++
++    // Quire start - main thread chunk cache
++    // Direct-mapped by the low two bits of each coordinate, so a 4x4 chunk neighbourhood never collides.
++    // Only positive lookups are cached; every fullChunks change evicts its slot (on the main thread, where
++    // Moonrise applies full status changes) or, from any other thread, flags the whole cache for clearing.
++    private final long[] quireCachedKeys = new long[16];
++    private final LevelChunk[] quireCachedChunks = new LevelChunk[16];
++    private volatile boolean quireCacheInvalidated;
++
++    private LevelChunk quire$getFullChunk(final int x, final int z) {
++        final long key = ChunkPos.pack(x, z);
++        if (Thread.currentThread() != this.mainThread) {
++            return this.fullChunks.get(key);
++        }
++        if (this.quireCacheInvalidated) {
++            this.quireCacheInvalidated = false;
++            java.util.Arrays.fill(this.quireCachedChunks, null);
++        }
++        final int slot = (x & 3) | ((z & 3) << 2);
++        LevelChunk chunk = this.quireCachedChunks[slot];
++        if (chunk != null && this.quireCachedKeys[slot] == key) {
++            return chunk;
++        }
++        chunk = this.fullChunks.get(key);
++        if (chunk != null) {
++            this.quireCachedKeys[slot] = key;
++            this.quireCachedChunks[slot] = chunk;
++        }
++        return chunk;
++    }
++
++    private void quire$invalidateCachedChunk(final int x, final int z, final long key) {
++        if (Thread.currentThread() != this.mainThread) {
++            this.quireCacheInvalidated = true;
++            return;
++        }
++        final int slot = (x & 3) | ((z & 3) << 2);
++        if (this.quireCachedKeys[slot] == key) {
++            this.quireCachedChunks[slot] = null;
++        }
++    }
++    // Quire end - main thread chunk cache
+     // Paper end
+ 
+     @Override
+@@ -309,7 +352,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     public @Nullable ChunkAccess getChunk(final int x, final int z, final ChunkStatus targetStatus, final boolean loadOrGenerate) {
+         // Paper start - rewrite chunk system
+         if (targetStatus == ChunkStatus.FULL) {
+-            final LevelChunk ret = this.fullChunks.get(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(x, z));
++            final LevelChunk ret = this.quire$getFullChunk(x, z); // Quire - main thread chunk cache
+ 
+             if (ret != null) {
+                 return ret;
+@@ -325,7 +368,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     @Override
+     public @Nullable LevelChunk getChunkNow(final int x, final int z) {
+         // Paper start - rewrite chunk system
+-        final LevelChunk ret = this.fullChunks.get(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(x, z));
++        final LevelChunk ret = this.quire$getFullChunk(x, z); // Quire - main thread chunk cache
+         if (!ca.spottedleaf.moonrise.common.PlatformHooks.get().hasCurrentlyLoadingChunk()) {
+             return ret;
+         }

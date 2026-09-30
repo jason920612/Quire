@@ -1,0 +1,660 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 29 Sep 2026 22:07:15 +0800
+Subject: [PATCH] Tile-parallel ticking of entities, block entities and chunk
+ random ticks (-Dquire.parallel=true)
+
+Units are grouped into tiles coloured 3x3; same-coloured tiles tick concurrently on TileWorker threads, each confined to its tile plus one ring. Out-of-area access, plugin event dispatch and global side effects (explosions, teleports, redstone wire/torches, stats, advancements, scoreboard, POI changes, tree/mushroom growth capture) escalate the worker to exclusive execution; plugin listeners and chunk loads run on the real main thread. Global entity callbacks are deferred and replayed on the main thread in task order. Shared generators, neighbour updaters and path type caches are per worker. Off by default.
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 31689cbde87c41b57e71f6ec01c06c9ad11b3f0c..b3a62a945cbaf475ed5958f71c29a80456483373 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -574,6 +574,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -614,6 +615,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -655,6 +657,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -696,6 +699,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -739,6 +743,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -782,6 +787,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+@@ -825,6 +831,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+         final int maxChunkZ = (Mth.floor(box.maxZ) + 2) >> 4;
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.accessRange(minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunkRange(this.world, minChunkX, minChunkZ, maxChunkX, maxChunkZ); // Quire - tile guard
+ 
+         final int minRegionX = minChunkX >> REGION_SHIFT;
+         final int minRegionZ = minChunkZ >> REGION_SHIFT;
+diff --git a/net/minecraft/advancements/triggers/SimpleCriterionTrigger.java b/net/minecraft/advancements/triggers/SimpleCriterionTrigger.java
+index b938e10fe5b5f3aae1d18ee769827535ed543a9c..9248c9b382ed39fa03f2780f0067d379ccbc9e5e 100644
+--- a/net/minecraft/advancements/triggers/SimpleCriterionTrigger.java
++++ b/net/minecraft/advancements/triggers/SimpleCriterionTrigger.java
+@@ -18,6 +18,7 @@ import net.minecraft.world.level.storage.loot.predicates.LootItemCondition;
+ 
+ public abstract class SimpleCriterionTrigger<T extends SimpleCriterionTrigger.SimpleInstance> implements CriterionTrigger<T> {
+     protected void trigger(final ServerPlayer player, final Predicate<T> matcher) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("advancement trigger"); // Quire - global side effects
+         PlayerAdvancements advancements = player.getAdvancements();
+         Map<PlayerAdvancements.TriggerInstanceKey, T> listenersForType = advancements.getTriggerMapForType(this);
+         if (listenersForType != null && !listenersForType.isEmpty()) {
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 3e31b6531aa2320c03a610b2ef64d60fd2392433..9a918eda97cb79fda9ddb072a04cb9bbf19f3f83 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -457,6 +457,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+ 
+     @Override
+     public final void moonrise$executeMidTickTasks() {
++        if (dev.quire.parallel.QuireParallel.ENABLED && dev.quire.parallel.QuireParallel.onWorker()) return; // Quire - main thread tasks never run on tile workers
+         final long startTime = System.nanoTime();
+         if ((startTime - this.lastMidTickExecute) <= CHUNK_TASK_QUEUE_BACKOFF_MIN_TIME || (startTime - this.lastMidTickExecuteFailure) <= TASK_EXECUTION_FAILURE_BACKOFF) {
+             // it's shown to be bad to constantly hit the queue (chunk loads slow to a crawl), even if no tasks are executed.
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index ef0b8ae834e55ead415e6389496ba692257dc481..15391be259e265fbfb7ddd48a175aa0b63709c3a 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -136,6 +136,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     private ChunkAccess getChunkFallback(final int chunkX, final int chunkZ, final ChunkStatus toStatus,
+                                          final boolean load) {
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.access(chunkX, chunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(this.level, chunkX, chunkZ); // Quire - tile guard
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler chunkTaskScheduler = ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this.level).moonrise$getChunkTaskScheduler();
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager chunkHolderManager = chunkTaskScheduler.chunkHolderManager;
+ 
+@@ -156,6 +157,9 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+             }
+         }
+ 
++        if (load && dev.quire.parallel.QuireParallel.ENABLED && dev.quire.parallel.QuireParallel.onWorker()) { // Quire - never block a tile worker on chunk loading
++            return dev.quire.parallel.QuireParallel.callOnMain(() -> this.syncLoad(chunkX, chunkZ, toStatus));
++        }
+         return load ? this.syncLoad(chunkX, chunkZ, toStatus) : null;
+     }
+     // Paper end - rewrite chunk system
+@@ -176,6 +180,16 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         final int size = entityTickingChunks.size();
+ 
+         java.util.Objects.checkFromToIndex(0, size, raw.length);
++        // Quire start - tile-parallel chunk ticks (random ticks, precipitation, lightning); spawning stays serial
++        if (dev.quire.parallel.QuireParallel.ENABLED && !dev.quire.parallel.ShadowStats.ENABLED
++            && net.minecraft.util.profiling.Profiler.get() == net.minecraft.util.profiling.InactiveProfiler.INSTANCE) {
++            dev.quire.parallel.QuireParallel.tickUnits(world, java.util.Arrays.asList(raw).subList(0, size),
++                chunk -> chunk.coordinateKey, chunk -> world.tickChunk(chunk, randomTickSpeed),
++                dev.quire.parallel.QuireParallel.UNIT_TILE_SHIFT);
++            ((ca.spottedleaf.moonrise.patches.chunk_system.server.ChunkSystemMinecraftServer)this.level.getServer()).moonrise$executeMidTickTasks();
++            return;
++        }
++        // Quire end - tile-parallel chunk ticks
+         for (int i = 0; i < size; ++i) {
+             if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.begin("chunk tick", raw[i].locX, raw[i].locZ); // Quire - shadow stats
+             try { // Quire - shadow stats
+@@ -298,6 +312,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+     private LevelChunk quire$getFullChunk(final int x, final int z) {
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.access(x, z); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(this.level, x, z); // Quire - tile guard
+         final long key = ChunkPos.pack(x, z);
+         if (Thread.currentThread() != this.mainThread) {
+             return this.fullChunks.get(key);
+@@ -724,6 +739,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         int zc = SectionPos.blockToSectionCoord(pos.getZ());
+         ChunkHolder chunk = this.getVisibleChunkIfPresent(ChunkPos.pack(xc, zc));
+         if (chunk != null && chunk.blockChanged(pos)) {
++            if (dev.quire.parallel.QuireParallel.onWorker()) { synchronized (this.level.quireLock) { this.chunkHoldersToBroadcast.add(chunk); } } else // Quire - tile workers
+             this.chunkHoldersToBroadcast.add(chunk);
+         }
+     }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 8bad6491fa0f150f5a26400e0bc8811395951510..39d5f4bcd0aa587c892866a33d3270145a9b824b 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -209,6 +209,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     private final LevelTicks<Block> blockTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+     private final LevelTicks<Fluid> fluidTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+     private final PathTypeCache pathTypesByPosCache = new PathTypeCache();
++
++    // Quire start - tile-parallel ticking
++    public PathTypeCache quire$mainPathTypeCache() {
++        return this.pathTypesByPosCache;
++    }
++    // Quire end - tile-parallel ticking
+     private final Set<Mob> navigatingMobs = new ObjectOpenHashSet<>();
+     private volatile boolean isUpdatingNavigations;
+     protected final Raids raids;
+@@ -336,6 +342,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     @Override
+     public final ChunkAccess moonrise$getAnyChunkIfLoaded(final int chunkX, final int chunkZ) {
+         if (dev.quire.parallel.ShadowStats.ENABLED) dev.quire.parallel.ShadowStats.access(chunkX, chunkZ); // Quire - shadow stats
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.checkChunk(this, chunkX, chunkZ); // Quire - tile guard
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder newChunkHolder = this.moonrise$getChunkTaskScheduler().chunkHolderManager.getChunkHolder(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(chunkX, chunkZ));
+         if (newChunkHolder == null) {
+             return null;
+@@ -355,6 +362,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+ 
+     @Override
+     public final void moonrise$midTickTasks() {
++        if (dev.quire.parallel.QuireParallel.ENABLED && dev.quire.parallel.QuireParallel.onWorker()) return; // Quire - main thread tasks never run on tile workers
+         ((ca.spottedleaf.moonrise.patches.chunk_system.server.ChunkSystemMinecraftServer)this.server).moonrise$executeMidTickTasks();
+     }
+ 
+@@ -731,7 +739,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         this.uncachedBiomeResolver = this.getChunkSource().getGenerator().getBiomeSource().createUncachedResolver(this.getChunkSource().randomState());
+         this.updateSkyBrightness();
+         // Paper start - rewrite chunk system
+-        this.moonrise$setEntityLookup(new ca.spottedleaf.moonrise.patches.chunk_system.level.entity.server.ServerEntityLookup((ServerLevel)(Object)this, ((ServerLevel)(Object)this).new EntityCallbacks()));
++        this.moonrise$setEntityLookup(new ca.spottedleaf.moonrise.patches.chunk_system.level.entity.server.ServerEntityLookup((ServerLevel)(Object)this, dev.quire.parallel.QuireParallel.ENABLED ? new dev.quire.parallel.DeferringLevelCallback<>(((ServerLevel)(Object)this).new EntityCallbacks()) : ((ServerLevel)(Object)this).new EntityCallbacks())); // Quire - defer global entity callbacks made on tile workers
+         this.chunkTaskScheduler = new ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler((ServerLevel)(Object)this);
+         this.entityDataController = new ca.spottedleaf.moonrise.patches.chunk_system.io.datacontroller.EntityDataController(
+             new ca.spottedleaf.moonrise.patches.chunk_system.io.datacontroller.EntityDataController.EntityRegionFileStorage(
+@@ -890,8 +898,8 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             }
+ 
+             io.papermc.paper.entity.activation.ActivationRange.activateEntities(this); // Paper - EAR
+-            this.entityTickList
+-                .forEach(
++            // Quire start - tile-parallel entity ticking
++            final java.util.function.Consumer<Entity> quireEntityTick =
+                     entity -> {
+                         if (!entity.isRemoved()) {
+                             if (!tickRateManager.isEntityFrozen(entity)) {
+@@ -917,8 +925,17 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                                 }
+                             }
+                         }
+-                    }
+-                );
++                    };
++            if (dev.quire.parallel.QuireParallel.ENABLED && !dev.quire.parallel.ShadowStats.ENABLED
++                && profiler == net.minecraft.util.profiling.InactiveProfiler.INSTANCE) {
++                // Snapshot in tick order; the profiler is captured by the lambda, so only when it is inactive (no-op)
++                final java.util.List<Entity> quireEntities = new java.util.ArrayList<>();
++                this.entityTickList.forEach(quireEntities::add);
++                dev.quire.parallel.QuireParallel.tickEntities(this, quireEntities, quireEntityTick);
++            } else {
++                this.entityTickList.forEach(quireEntityTick);
++            }
++            // Quire end - tile-parallel entity ticking
+             if (this.paperConfig().unsupportedSettings.ticking.blockEntities) { // Paper - option to disable ticking
+             profiler.popPush("blockEntities");
+             this.tickBlockEntities();
+@@ -975,10 +992,19 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     // Paper start - optimise random ticking
+     private final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = new ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom(net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed());
+ 
++    // Quire start - tile-parallel chunk ticks: the random tick generator is not thread safe
++    private ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom quire$simpleRandom() {
++        if (dev.quire.parallel.QuireParallel.ENABLED && Thread.currentThread() instanceof dev.quire.parallel.TileWorker worker) {
++            return worker.random;
++        }
++        return this.simpleRandom;
++    }
++    // Quire end
++
+     private void optimiseRandomTick(final LevelChunk chunk, final int tickSpeed) {
+         final LevelChunkSection[] sections = chunk.getSections();
+         final int minSection = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection((ServerLevel)(Object)this);
+-        final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = this.simpleRandom;
++        final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = this.quire$simpleRandom(); // Quire - per worker
+         final boolean doubleTickFluids = !ca.spottedleaf.moonrise.common.PlatformHooks.get().configFixMC224294();
+ 
+         final ChunkPos cpos = chunk.getPos();
+@@ -1025,7 +1051,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     // Paper end - optimise random ticking
+ 
+     public void tickChunk(final LevelChunk chunk, final int tickSpeed) {
+-        final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = this.simpleRandom; // Paper - optimise random ticking
++        final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = this.quire$simpleRandom(); // Paper - optimise random ticking // Quire - per worker
+         ChunkPos chunkPos = chunk.getPos();
+         int minX = chunkPos.getMinBlockX();
+         int minZ = chunkPos.getMinBlockZ();
+@@ -1867,11 +1893,18 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         }
+ 
+         this.getChunkSource().blockChanged(pos);
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.invalidatePathType(this, pos); else // Quire - per worker path type caches
+         this.pathTypesByPosCache.invalidate(pos);
+         if (this.paperConfig().misc.updatePathfindingOnBlockUpdate) { // Paper - option to disable pathfinding updates
+         VoxelShape oldShape = old.getCollisionShape(this, pos);
+         VoxelShape newShape = current.getCollisionShape(this, pos);
+         if (Shapes.joinIsNotEmpty(oldShape, newShape, BooleanOp.NOT_SAME)) {
++            // Quire start - on a tile worker, only mobs inside this task's safe area may be touched now
++            if (dev.quire.parallel.QuireParallel.ENABLED && dev.quire.parallel.QuireParallel.onWorker()) {
++                dev.quire.parallel.QuireParallel.updateNavigations(this, this.navigatingMobs, pos);
++                return;
++            }
++            // Quire end
+             List<PathNavigation> navigationsToUpdate = new ObjectArrayList<>();
+ 
+             try { // Paper - catch CME see below why
+@@ -1918,26 +1951,26 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     @Override
+     public void updateNeighborsAt(final BlockPos pos, final Block sourceBlock, final @Nullable Orientation orientation) {
+         if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
+-        this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, sourceBlock, null, orientation);
++        this.quire$neighborUpdater().updateNeighborsAtExceptFromFacing(pos, sourceBlock, null, orientation);
+     }
+ 
+     @Override
+     public void updateNeighborsAtExceptFromFacing(
+         final BlockPos pos, final Block blockObject, final Direction skipDirection, final @Nullable Orientation orientation
+     ) {
+-        this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, blockObject, skipDirection, orientation);
++        this.quire$neighborUpdater().updateNeighborsAtExceptFromFacing(pos, blockObject, skipDirection, orientation);
+     }
+ 
+     @Override
+     public void neighborChanged(final BlockPos pos, final Block changedBlock, final @Nullable Orientation orientation) {
+-        this.neighborUpdater.neighborChanged(pos, changedBlock, orientation);
++        this.quire$neighborUpdater().neighborChanged(pos, changedBlock, orientation);
+     }
+ 
+     @Override
+     public void neighborChanged(
+         final BlockState state, final BlockPos pos, final Block changedBlock, final @Nullable Orientation orientation, final boolean movedByPiston
+     ) {
+-        this.neighborUpdater.neighborChanged(state, pos, changedBlock, orientation, movedByPiston);
++        this.quire$neighborUpdater().neighborChanged(state, pos, changedBlock, orientation, movedByPiston);
+     }
+ 
+     @Override
+@@ -2051,6 +2084,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+ 
+     @Override
+     public void blockEvent(final BlockPos pos, final Block block, final int b0, final int b1) {
++        if (dev.quire.parallel.QuireParallel.onWorker()) { synchronized (this.quireLock) { this.blockEvents.add(new BlockEventData(pos, block, b0, b1)); } return; } // Quire - tile workers
+         this.blockEvents.add(new BlockEventData(pos, block, b0, b1));
+     }
+ 
+@@ -2910,6 +2944,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     }
+ 
+     public PathTypeCache getPathTypeCache() {
++        if (dev.quire.parallel.QuireParallel.ENABLED && Thread.currentThread() instanceof dev.quire.parallel.TileWorker worker) return worker.pathTypeCache(this); // Quire - per worker path type caches
+         return this.pathTypesByPosCache;
+     }
+ 
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 23b3a82ab3e1c6abc85000d9285470cb12300a6b..53ff045a38eae1180d59b2edcf6815e33ec7ac8e 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -2118,6 +2118,7 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+ 
+     @Override
+     public void awardStat(final Stat<?> stat, final int count) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("player statistics"); // Quire - global side effects
+         this.stats.increment(this, stat, count);
+         this.level().getCraftServer().getScoreboardManager().forAllObjectives(stat, this, score -> score.add(count)); // CraftBukkit - Get our scores instead
+     }
+diff --git a/net/minecraft/server/waypoints/ServerWaypointManager.java b/net/minecraft/server/waypoints/ServerWaypointManager.java
+index bcd60a2bbc7b24b9925f4c14f689a55d1e567556..c628607dbcdeb0da6ca7ed903bd9fbb02b42003e 100644
+--- a/net/minecraft/server/waypoints/ServerWaypointManager.java
++++ b/net/minecraft/server/waypoints/ServerWaypointManager.java
+@@ -68,19 +68,19 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     private final java.util.LinkedHashSet<WaypointTransmitter> quireDirtyWaypoints = new java.util.LinkedHashSet<>();
+     private final java.util.LinkedHashSet<ServerPlayer> quireDirtyPlayers = new java.util.LinkedHashSet<>();
+ 
+-    public void quire$markWaypointMoved(final WaypointTransmitter waypoint) {
++    public synchronized void quire$markWaypointMoved(final WaypointTransmitter waypoint) {
+         if (this.locatorBarEnabled) {
+             this.quireDirtyWaypoints.add(waypoint);
+         }
+     }
+ 
+-    public void quire$markPlayerMoved(final ServerPlayer player) {
++    public synchronized void quire$markPlayerMoved(final ServerPlayer player) {
+         if (this.locatorBarEnabled) {
+             this.quireDirtyPlayers.add(player);
+         }
+     }
+ 
+-    public void quire$flushDirty() {
++    public synchronized void quire$flushDirty() {
+         if (!this.quireDirtyWaypoints.isEmpty()) {
+             final WaypointTransmitter[] dirty = this.quireDirtyWaypoints.toArray(new WaypointTransmitter[0]);
+             this.quireDirtyWaypoints.clear();
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index a7b9e79f4b3ec5907726b1aeabfb5c0ade5e7e14..2b68afed3a08ef045203a78c4f5a16612e70fb6b 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -174,7 +174,7 @@ public abstract class Entity
+     }
+ 
+     // Paper start - Share random for entities to make them more random
+-    public static RandomSource SHARED_RANDOM = new RandomRandomSource();
++    public static RandomSource SHARED_RANDOM = dev.quire.parallel.QuireParallel.ENABLED ? new dev.quire.parallel.ThreadAwareRandom(new RandomRandomSource()) : new RandomRandomSource(); // Quire - per worker stream when parallel
+     // Paper start - replace random
+     private static final class RandomRandomSource extends ca.spottedleaf.moonrise.common.util.ThreadUnsafeRandom {
+         public RandomRandomSource() {
+@@ -4206,6 +4206,7 @@ public abstract class Entity
+     }
+ 
+     public @Nullable Entity teleport(TeleportTransition transition) { // Paper - remove param final
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("teleport"); // Quire - global side effects
+         // Paper start - Fix item duplication and teleport issues
+         if ((!this.isAlive() || !this.valid) && (transition.newLevel() != this.level)) {
+             LOGGER.warn("Illegal Entity Teleport {} to {}:{}", this, transition.newLevel(), transition.position(), new Throwable());
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index 078054c499e7b29d64543f92c1808b5623e3c8e5..1bfd52b9a8508baf391205177e62fe37d06a3e2e 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -143,6 +143,12 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+     protected final GoalSelector goalSelector;
+     public net.minecraft.world.entity.ai.goal.@Nullable FloatGoal goalFloat; // Paper - Allow nerfed mobs to jump and float
+     public GoalSelector targetSelector;
++
++    // Quire start - tile-parallel ticking
++    public boolean quire$hasPluginGoals() {
++        return this.goalSelector.quire$hasPluginGoals() || (this.targetSelector != null && this.targetSelector.quire$hasPluginGoals());
++    }
++    // Quire end
+     private @Nullable LivingEntity target;
+     private final Sensing sensing;
+     private DropChances dropChances = DropChances.DEFAULT;
+diff --git a/net/minecraft/world/entity/ai/goal/GoalSelector.java b/net/minecraft/world/entity/ai/goal/GoalSelector.java
+index 0439543fbb25ddb974550fe9dbdaa479e330937d..c79ca490468d907583a9e2b32ebaf294166abecd 100644
+--- a/net/minecraft/world/entity/ai/goal/GoalSelector.java
++++ b/net/minecraft/world/entity/ai/goal/GoalSelector.java
+@@ -29,7 +29,20 @@ public class GoalSelector {
+ 
+     public void addGoal(final int prio, final Goal goal) {
+         this.availableGoals.add(new WrappedGoal(prio, goal));
++        // Quire start - goals implemented by plugins run plugin code during the entity tick
++        if (goal instanceof com.destroystokyo.paper.entity.ai.PaperCustomGoal<?> || goal.getClass().getClassLoader() != GoalSelector.class.getClassLoader()) {
++            this.quireHasPluginGoals = true;
++        }
++        // Quire end
++    }
++
++    // Quire start - tile-parallel ticking
++    private boolean quireHasPluginGoals;
++
++    public boolean quire$hasPluginGoals() {
++        return this.quireHasPluginGoals;
+     }
++    // Quire end
+ 
+     public void removeAllGoals(final Predicate<Goal> predicate) {
+         for (WrappedGoal availableGoal : this.availableGoals) {
+diff --git a/net/minecraft/world/entity/ai/village/poi/PoiManager.java b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+index 3b07e731e8d16c2b71cb55b85163029cf56fd02e..f16c0af06e05dc4025376f0740908586d81c4597 100644
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -195,10 +195,12 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+     }
+ 
+     public @Nullable PoiRecord add(final BlockPos pos, final Holder<PoiType> type) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("poi change"); // Quire - global side effects
+         return this.getOrCreate(SectionPos.asLong(pos)).add(pos, type);
+     }
+ 
+     public void remove(final BlockPos pos) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("poi change"); // Quire - global side effects
+         this.getOrLoad(SectionPos.asLong(pos)).ifPresent(poiSection -> poiSection.remove(pos));
+     }
+ 
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 5d53e2b44e92420a32dc996c4bf81296dc5be1ec..d6c409199c795201d779c22413896b8745ad8c82 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -130,7 +130,20 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     public float rainLevel;
+     protected float oThunderLevel;
+     public float thunderLevel;
+-    protected final RandomSource random = new ca.spottedleaf.moonrise.common.util.ThreadUnsafeRandom(net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed()); // Paper - replace random
++    protected final RandomSource random = dev.quire.parallel.QuireParallel.ENABLED ? new dev.quire.parallel.ThreadAwareRandom(new ca.spottedleaf.moonrise.common.util.ThreadUnsafeRandom(net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed())) : new ca.spottedleaf.moonrise.common.util.ThreadUnsafeRandom(net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed()); // Paper - replace random // Quire - per worker stream when parallel
++    // Quire start - tile-parallel ticking
++    /** Guards level-global structures (entity lists, block events, scheduled ticks, ...) against concurrent tile workers. */
++    public final Object quireLock = new Object();
++    private int quireMaxChainedNeighborUpdates;
++
++    /** The neighbour updater of the current thread (each tile worker has its own; the collecting updater is stateful). */
++    public final CollectingNeighborUpdater quire$neighborUpdater() {
++        if (dev.quire.parallel.QuireParallel.ENABLED && Thread.currentThread() instanceof dev.quire.parallel.TileWorker worker) {
++            return worker.neighborUpdater(this, this.quireMaxChainedNeighborUpdates);
++        }
++        return this.neighborUpdater;
++    }
++    // Quire end - tile-parallel ticking
+     @Deprecated
+     private final RandomSource soundSeedGenerator = RandomSource.createThreadSafe();
+     private final Holder<DimensionType> dimensionTypeRegistration;
+@@ -868,6 +881,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         this.biomeManager = new BiomeManager(this, biomeZoomSeed);
+         this.isDebug = isDebug;
+         this.neighborUpdater = new CollectingNeighborUpdater(this, maxChainedNeighborUpdates);
++        this.quireMaxChainedNeighborUpdates = maxChainedNeighborUpdates; // Quire - per worker neighbour updaters
+         this.registryAccess = registryAccess;
+         this.palettedContainerFactory = PalettedContainerFactory.create(registryAccess);
+         this.damageSources = new DamageSources(registryAccess);
+@@ -1272,7 +1286,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         final @Block.UpdateFlags int updateFlags,
+         final int updateLimit
+     ) {
+-        this.neighborUpdater.shapeUpdate(direction, neighborState, pos, neighborPos, updateFlags, updateLimit);
++        this.quire$neighborUpdater().shapeUpdate(direction, neighborState, pos, neighborPos, updateFlags, updateLimit); // Quire - per worker neighbour updater
+     }
+ 
+     @Override
+@@ -1482,6 +1496,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     public void addBlockEntityTicker(final TickingBlockEntity ticker) {
+         if (!this.paperConfig().unsupportedSettings.ticking.blockEntities) return; // Paper - option to disable ticking
++        if (dev.quire.parallel.QuireParallel.onWorker()) { synchronized (this.quireLock) { this.pendingBlockEntityTickers.add(ticker); } return; } // Quire - never touch the ticking list from a worker
+         (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(ticker);
+     }
+ 
+@@ -1499,6 +1514,27 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         // Paper start - Fix MC-117075 use removeAll
+         final it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<@Nullable TickingBlockEntity> toRemove = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>();
+         toRemove.add(null);
++        // Quire start - tile-parallel block entity ticking
++        if (dev.quire.parallel.QuireParallel.ENABLED && !dev.quire.parallel.ShadowStats.ENABLED && this instanceof net.minecraft.server.level.ServerLevel serverLevel
++            && net.minecraft.util.profiling.Profiler.get() == net.minecraft.util.profiling.InactiveProfiler.INSTANCE) {
++            final java.util.List<TickingBlockEntity> quireTickers = new java.util.ArrayList<>(this.blockEntityTickers.size());
++            for (int tickerIndex = 0; tickerIndex < this.blockEntityTickers.size(); tickerIndex++) {
++                final TickingBlockEntity ticker = this.blockEntityTickers.get(tickerIndex);
++                if (ticker.isRemoved()) {
++                    toRemove.add(ticker);
++                } else if (tickBlockEntities && this.shouldTickBlocksAt(ticker.getPos())) {
++                    quireTickers.add(ticker);
++                }
++            }
++            dev.quire.parallel.QuireParallel.tickUnits(serverLevel, quireTickers,
++                ticker -> ((long) (ticker.getPos().getZ() >> 4) << 32) | ((ticker.getPos().getX() >> 4) & 0xFFFFFFFFL),
++                TickingBlockEntity::tick, dev.quire.parallel.QuireParallel.UNIT_TILE_SHIFT);
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)(Level)(Object)this).moonrise$midTickTasks();
++            this.blockEntityTickers.removeAll(toRemove);
++            this.tickingBlockEntities = false;
++            return;
++        }
++        // Quire end - tile-parallel block entity ticking
+         for (int tickerIndex = 0; tickerIndex < this.blockEntityTickers.size(); tickerIndex++) {
+             final TickingBlockEntity ticker = this.blockEntityTickers.get(tickerIndex);
+         // Paper end - Fix MC-117075 use removeAll
+@@ -2129,8 +2165,16 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     public abstract RecipeAccess recipeAccess();
+ 
+     public BlockPos getBlockRandomPos(final int xo, final int yo, final int zo, final int yMask) {
++        // Quire start - tile workers keep their own sequence (the shared field is not thread safe)
++        final int val;
++        if (dev.quire.parallel.QuireParallel.ENABLED && Thread.currentThread() instanceof dev.quire.parallel.TileWorker worker) {
++            worker.randValue = worker.randValue * 3 + 1013904223;
++            val = worker.randValue >> 2;
++        } else {
+         this.randValue = this.randValue * 3 + 1013904223;
+-        int val = this.randValue >> 2;
++        val = this.randValue >> 2;
++        }
++        // Quire end
+         return new BlockPos(xo + (val & 15), yo + (val >> 16 & yMask), zo + (val >> 8 & 15));
+     }
+ 
+diff --git a/net/minecraft/world/level/ServerExplosion.java b/net/minecraft/world/level/ServerExplosion.java
+index a2893f4298af62177fc3621603d465e24fe1e2eb..77898ab98a87296332f2c36a4d0827df489de833 100644
+--- a/net/minecraft/world/level/ServerExplosion.java
++++ b/net/minecraft/world/level/ServerExplosion.java
+@@ -623,6 +623,7 @@ public class ServerExplosion implements Explosion {
+     }
+ 
+     public int explode() {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("explosion"); // Quire - global side effects
+         // Paper start - collision optimisations
+         this.blockCache = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
+         this.chunkPosCache = new long[CHUNK_CACHE_WIDTH * CHUNK_CACHE_WIDTH];
+diff --git a/net/minecraft/world/level/block/MushroomBlock.java b/net/minecraft/world/level/block/MushroomBlock.java
+index c0779cb3c237e4399a53a7e6fc95bb2d88483bca..f25c4beefbbb1e580ae4abbfba54775488f38fe6 100644
+--- a/net/minecraft/world/level/block/MushroomBlock.java
++++ b/net/minecraft/world/level/block/MushroomBlock.java
+@@ -77,6 +77,7 @@ public class MushroomBlock extends VegetationBlock implements BonemealableBlock
+     }
+ 
+     public boolean growMushroom(final ServerLevel level, final BlockPos pos, final BlockState state, final RandomSource random) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("huge mushroom growth"); // Quire - static SaplingBlock.treeType
+         Optional<? extends Holder<Feature>> feature = level.registryAccess().lookupOrThrow(Registries.FEATURE).get(this.feature);
+         if (feature.isEmpty()) {
+             return false;
+diff --git a/net/minecraft/world/level/block/RedstoneTorchBlock.java b/net/minecraft/world/level/block/RedstoneTorchBlock.java
+index e6680b9bfa001e6c00598256f13d4e74b64dc32c..fbf3c6c416e9aa85b86a9d01d0ba3c55d9ce7575 100644
+--- a/net/minecraft/world/level/block/RedstoneTorchBlock.java
++++ b/net/minecraft/world/level/block/RedstoneTorchBlock.java
+@@ -139,6 +139,7 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
+     }
+ 
+     private static boolean isToggledTooFrequently(final Level level, final BlockPos pos, final boolean add) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("redstone torch"); // Quire - global side effects
+         // Paper start - Faster redstone torch rapid clock removal
+         java.util.ArrayDeque<RedstoneTorchBlock.Toggle> toggles = level.redstoneUpdateInfos;
+         if (toggles == null) {
+diff --git a/net/minecraft/world/level/block/RedstoneWireBlock.java b/net/minecraft/world/level/block/RedstoneWireBlock.java
+index ede64a0afbcdc41e60c3f2f5917c89f09b888433..fda0f900790ead52bf53b3d34c56909fca38dcdd 100644
+--- a/net/minecraft/world/level/block/RedstoneWireBlock.java
++++ b/net/minecraft/world/level/block/RedstoneWireBlock.java
+@@ -319,6 +319,7 @@ public class RedstoneWireBlock extends Block {
+         final @Nullable Orientation orientation,
+         final boolean shapeUpdateWiresAroundInitialPosition
+     ) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("redstone wire"); // Quire - wire evaluators are shared, stateful
+         if (useExperimentalEvaluator(level)) {
+             new ExperimentalRedstoneWireEvaluator(this).updatePowerStrength(level, pos, state, orientation, shapeUpdateWiresAroundInitialPosition);
+         } else {
+diff --git a/net/minecraft/world/level/block/SaplingBlock.java b/net/minecraft/world/level/block/SaplingBlock.java
+index 5564a54f23aab158b9506325953ec70cab55c961..a78f38dd18b7b0647c7bff9bc2d28c4951e497b3 100644
+--- a/net/minecraft/world/level/block/SaplingBlock.java
++++ b/net/minecraft/world/level/block/SaplingBlock.java
+@@ -46,6 +46,7 @@ public class SaplingBlock extends VegetationBlock implements BonemealableBlock {
+             level.setBlock(pos, state.cycle(STAGE), Block.UPDATE_NONE);
+         } else {
+             // CraftBukkit start
++            if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("tree growth capture"); // Quire - the capture flags are level-global
+             if (level.captureTreeGeneration) {
+                 this.treeGrower.growTree(level, level.getChunkSource().getGenerator(), pos, state, random);
+             } else {
+diff --git a/net/minecraft/world/scores/Scoreboard.java b/net/minecraft/world/scores/Scoreboard.java
+index 4a15851bda30c918c58c96d2cb98b74f30db396c..86d7b61894a88f6f767cf9ad9a9e53e0879362af 100644
+--- a/net/minecraft/world/scores/Scoreboard.java
++++ b/net/minecraft/world/scores/Scoreboard.java
+@@ -61,6 +61,7 @@ public class Scoreboard {
+     }
+ 
+     public final void forAllObjectives(final ObjectiveCriteria criteria, final ScoreHolder name, final Consumer<ScoreAccess> operation) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("scoreboard"); // Quire - global side effects
+         this.objectivesByCriteria.getOrDefault(criteria, Collections.emptyList()).forEach(o -> operation.accept(this.getOrCreatePlayerScore(name, o, true)));
+     }
+ 
+@@ -73,6 +74,7 @@ public class Scoreboard {
+     }
+ 
+     public ScoreAccess getOrCreatePlayerScore(final ScoreHolder scoreHolder, final Objective objective, final boolean forceWritable) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("scoreboard"); // Quire - global side effects
+         final boolean canModify = forceWritable || !objective.getCriteria().isReadOnly();
+         PlayerScores playerScore = this.getOrCreatePlayerInfo(scoreHolder.getScoreboardName());
+         final MutableBoolean requiresSync = new MutableBoolean();
+@@ -187,6 +189,7 @@ public class Scoreboard {
+     }
+ 
+     public void resetAllPlayerScores(final ScoreHolder player) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("scoreboard"); // Quire - global side effects
+         PlayerScores removed = this.playerScores.remove(player.getScoreboardName());
+         if (removed != null) {
+             this.onPlayerRemoved(player);
+@@ -194,6 +197,7 @@ public class Scoreboard {
+     }
+ 
+     public void resetSinglePlayerScore(final ScoreHolder player, final Objective objective) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("scoreboard"); // Quire - global side effects
+         PlayerScores scores = this.playerScores.get(player.getScoreboardName());
+         if (scores != null) {
+             boolean hasRemoved = scores.remove(objective);
+@@ -270,6 +274,7 @@ public class Scoreboard {
+     }
+ 
+     public boolean addPlayerToTeam(final String player, final PlayerTeam team) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("scoreboard"); // Quire - global side effects
+         if (this.getPlayersTeam(player) != null) {
+             this.removePlayerFromTeam(player);
+         }
+@@ -279,6 +284,7 @@ public class Scoreboard {
+     }
+ 
+     public boolean removePlayerFromTeam(final String player) {
++        if (dev.quire.parallel.QuireParallel.ENABLED) dev.quire.parallel.QuireParallel.requireExclusive("scoreboard"); // Quire - global side effects
+         PlayerTeam team = this.getPlayersTeam(player);
+         if (team != null) {
+             this.removePlayerFromTeam(player, team);
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..79209f0011e0d457002bcfadd3b87ac2f8fae1fc 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -69,6 +69,11 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+ 
+     @Override
+     public void schedule(final ScheduledTick<T> tick) {
++        if (dev.quire.parallel.QuireParallel.ENABLED && dev.quire.parallel.QuireParallel.onWorker()) { synchronized (this) { this.schedule0(tick); } return; } // Quire - tile workers
++        this.schedule0(tick);
++    }
++
++    private void schedule0(final ScheduledTick<T> tick) { // Quire - split for locking
+         long chunkKey = ChunkPos.pack(tick.pos());
+         LevelChunkTicks<T> tickContainer = this.allContainers.get(chunkKey);
+         if (tickContainer == null) {
