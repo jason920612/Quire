@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 1 Oct 2026 16:34:36 +0800
+Subject: [PATCH] Tracker: tolerate a plugin-replaced seenBy set (Citizens
+ swaps it by reflection)
+
+
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index cf81c8d1af25a52fc04148d9c222fb31f9a41305..6e1007ea29e9de06ab9690e5fec8f0884c356af9 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1622,6 +1622,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         private void quire$updatePlayersFast(final QuireTrackerSnapshot snapshot, final ServerPlayer[] playersRaw, final int len) {
+             final Entity entity = this.entity;
++            final Set<ServerPlayerConnection> seenBy = this.seenBy;
+             final double ex = entity.getX();
+             final double ey = entity.getY();
+             final double ez = entity.getZ();
+@@ -1672,7 +1673,10 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                 if (visible) {
+                     visible = snapshot.noOverrides[s] ? entity.visibleByDefault : player.getBukkitEntity().quire$canSee(entity);
+                 }
+-                final boolean seen = ((dev.quire.util.HashedReferenceSet<ServerPlayerConnection>) this.seenBy).containsHashed(snapshot.connections[s], snapshot.connectionHashes[s]); // Quire - precomputed hash
++                // Quire - precomputed hash; plugins (Citizens) may replace seenBy with their own set by reflection
++                final boolean seen = seenBy instanceof dev.quire.util.HashedReferenceSet<?> hashed
++                    ? hashed.containsHashed(snapshot.connections[s], snapshot.connectionHashes[s])
++                    : seenBy.contains(snapshot.connections[s]);
+                 if (visible != seen) {
+                     this.updatePlayer(player);
+                 }
